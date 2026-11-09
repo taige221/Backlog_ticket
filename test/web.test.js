@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile, readdir, symlink } from 'node:fs/promises';
+import { chmod, cp, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile, readdir, symlink } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createWebApp, trustedRequest } from '../src/web-server.js';
@@ -82,6 +82,86 @@ test('web draft/revision/create preserves named attachments and locks every revi
   assert(!JSON.stringify(state).includes('PRIVATE'));
 });
 
+test('重新打开草稿恢复当前分支的原始描述和修改，模型沿用该分支上下文', async t => {
+  const app = await fixture(t);
+  const original = '仅在 Safari 私密浏览时复现，正文里先不写这条';
+  const first = (await app.post('draft', { request: original, uploadIds: [] })).draft;
+  const main = (await app.post('revise', { id: first.id, instruction: '补充具体点击位置' })).draft;
+  const sibling = (await app.post('revise', { id: first.id, instruction: '改为后端任务' })).draft;
+  const edit = (await app.post('draft/edit', { id: main.id, summary: '手工标题', description: main.description })).draft;
+  const latest = (await app.post('revise', { id: edit.id, instruction: '补回首次描述里省略的复现环境' })).draft;
+  const modelCalls = app.seen.filter(item => item.route.endsWith('/responses'));
+  const sent = JSON.parse(JSON.parse(modelCalls.at(-1).body).input[0].content[0].text);
+  assert.equal(sent.previousDraft.summary, '手工标题');
+  assert.deepEqual(sent.conversation, { originalReport: original, recentRequests: ['补充具体点击位置'] });
+
+  const restored = await createWebApp({ filename: app.filename });
+  t.after(() => restored.close());
+  const getMessages = async id => (await restored.dispatch('GET', `/api/history/${id}`)).messages.map(turn => [turn.request, turn.draftId]);
+  assert.deepEqual(await getMessages(latest.id), [[original, first.id], ['补充具体点击位置', main.id], ['补回首次描述里省略的复现环境', latest.id]]);
+  assert.deepEqual(await getMessages(sibling.id), [[original, first.id], ['改为后端任务', sibling.id]]);
+  assert.deepEqual(await getMessages(first.id), [[original, first.id]]);
+});
+
+test('数据目录迁移后，相对路径与旧版绝对路径都能恢复原分支', async t => {
+  const app = await fixture(t);
+  const first = (await app.post('draft', { request: '首次问题', uploadIds: [] })).draft;
+  const second = (await app.post('revise', { id: first.id, instruction: '第二轮' })).draft;
+  const third = (await app.post('revise', { id: second.id, instruction: '第三轮' })).draft;
+  const latest = (await app.post('revise', { id: third.id, instruction: '第四轮' })).draft;
+  await app.post('revise', { id: first.id, instruction: '另一分支' });
+  const draftPath = id => path.join(app.root, 'drafts', `${id}.json`);
+  for (const [id, revisionOf] of [[second.id, path.posix.join('/old/location/drafts', `${first.id}.json`)], [third.id, path.win32.join('D:/Old/Ticket/drafts', `${second.id}.json`)]]) {
+    const file = draftPath(id);
+    await writeFile(file, JSON.stringify({ ...JSON.parse(await readFile(file, 'utf8')), revisionOf }));
+  }
+  assert.equal(JSON.parse(await readFile(draftPath(latest.id), 'utf8')).revisionOf, `${third.id}.json`);
+  const moved = await mkdtemp(path.join(tmpdir(), 'ticket-web-moved-'));
+  t.after(() => rm(moved, { recursive: true, force: true }));
+  await cp(app.root, moved, { recursive: true });
+  const restored = await createWebApp({ filename: path.join(moved, 'config.json') });
+  t.after(() => restored.close());
+  const { messages, warning } = await restored.dispatch('GET', `/api/history/${latest.id}`);
+  assert.deepEqual(messages.map(turn => turn.request), ['首次问题', '第二轮', '第三轮', '第四轮']);
+  assert.equal(warning, undefined);
+  assert.equal((await restored.dispatch('POST', '/api/draft/delete', { id: latest.id })).deletedIds.length, 5);
+});
+
+test('对话记录不可读或目录不可用时仍能继续修改，并报告缺失的上下文', async t => {
+  const app = await fixture(t);
+  const first = (await app.post('draft', { request: '首次问题', uploadIds: [] })).draft;
+  const second = (await app.post('revise', { id: first.id, instruction: '第二轮' })).draft;
+  const directory = path.join(app.root, 'conversations', first.rootId);
+  const firstTurn = path.join(directory, `${first.id}.json`);
+  const canTestPermissions = process.platform !== 'win32' && process.getuid?.() !== 0;
+  if (canTestPermissions) await chmod(firstTurn, 0o000);
+  else await writeFile(firstTurn, '{invalid');
+  let result;
+  try {
+    const history = await app.get(`history/${second.id}`);
+    assert.match(history.warning, /无法读取/);
+    assert.deepEqual(history.messages.map(turn => turn.request), ['第二轮']);
+    result = await app.post('revise', { id: second.id, instruction: '第三轮' });
+    assert.deepEqual((await app.get(`history/${result.draft.id}`)).messages.map(turn => turn.request), ['第二轮', '第三轮']);
+  } finally {
+    if (canTestPermissions) await chmod(firstTurn, 0o600);
+  }
+  assert.match(result.warning, /无法读取/);
+  assert.equal(result.draft.revisionOf, second.id);
+  const lastRequest = () => JSON.parse(JSON.parse(app.seen.findLast(item => item.route.endsWith('/responses')).body).input[0].content[0].text);
+  assert.deepEqual(lastRequest().conversation, { recentRequests: ['第二轮'] });
+  assert.equal(lastRequest().previousDraft.summary, second.summary);
+
+  await rename(directory, directory + '.backup');
+  await writeFile(directory, '目录异常');
+  const fallback = await app.post('revise', { id: result.draft.id, instruction: '第四轮' });
+  assert.match(fallback.warning, /无法读取.*未能保存/);
+  assert.equal(fallback.draft.revisionOf, result.draft.id);
+  assert.equal(lastRequest().conversation, undefined);
+  assert.equal(lastRequest().report, '第四轮');
+  assert.equal(await readFile(directory, 'utf8'), '目录异常');
+});
+
 test('起票语言持久保存，修改保留原稿语言，显式切换保存新版本并保留其他字段', async t => {
   const app = await fixture(t);
   assert.deepEqual((await app.get('state')).languages, { 'zh-CN': '简体中文', ja: '日本語', en: 'English' });
@@ -158,7 +238,8 @@ test('附件占用可见，移除实际删除文件与记录；清理保留当�
   await assert.rejects(app.post('storage/cleanup', { keepIds: ['../config'] }), /编号无效/);
   await app.post('uploads/remove', { ids: [removed.id] });
   for (const file of [path.join(removed.id, removed.name), `${removed.id}.json`]) await assert.rejects(readFile(path.join(app.root, 'uploads', file)), { code: 'ENOENT' });
-  const cleaned = await app.post('storage/cleanup', { keepIds: [kept.id] });
+  const keepIds = [kept.id, ...Array.from({ length: 10 }, () => crypto.randomUUID())];
+  const cleaned = await app.post('storage/cleanup', { keepIds });
   assert.equal(cleaned.removedFiles, 1); assert(cleaned.freedBytes > 1024); assert.equal(cleaned.storage.files, 1);
   await assert.rejects(readFile(path.join(app.root, 'uploads', orphan.id, orphan.name)), { code: 'ENOENT' });
   assert.equal((await readFile(path.join(app.root, 'uploads', kept.id, kept.name))).length, 1024);
@@ -215,7 +296,7 @@ test('删除整份草稿的所有历史与分支，回收独用附件，保护�
   const other = (await app.post('draft', { request: '保留草稿', uploadIds: [shared.id] })).draft;
   const originalFile = path.join(app.root, '原始文件.txt'); await writeFile(originalFile, '保留原文件');
   const saved = JSON.parse(await readFile(path.join(app.root, 'drafts', `${first.id}.json`), 'utf8'));
-  for (let i = 0; i < 52; i++) await saveJson(path.join(app.root, 'drafts', `old-${i}.json`), { ...saved, attachments: [...saved.attachments, originalFile] });
+  for (let i = 0; i < 52; i++) await saveJson(path.join(app.root, 'drafts', `old-${i}.json`), { ...saved, revisionOf: `${first.id}.json`, attachments: [...saved.attachments, originalFile] });
   const usageBefore = await app.get('usage/delete-family'), configBefore = await readFile(app.filename, 'utf8');
   const seenBefore = app.seen.length;
   const result = await app.post('draft/delete', { id: next.id });
@@ -226,7 +307,149 @@ test('删除整份草稿的所有历史与分支，回收独用附件，保护�
   for (const upload of [shared, pending]) assert.equal(await readFile(path.join(app.root, 'uploads', upload.id, upload.name), 'utf8'), 'x');
   assert.equal(await readFile(originalFile, 'utf8'), '保留原文件'); assert.equal(await readFile(app.filename, 'utf8'), configBefore);
   assert.deepEqual((await app.get('usage/delete-family')).conversation, usageBefore.conversation);
+  await assert.rejects(readdir(path.join(app.root, 'conversations', first.rootId)), { code: 'ENOENT' });
+  assert.deepEqual((await app.get(`history/${other.id}`)).messages.map(turn => turn.request), ['保留草稿']);
   await assert.rejects(app.post('revise', { id: first.id, instruction: '不能再改' }), { code: 'ENOENT' });
+});
+
+test('删除只移除当前对话，同项目同工单的独立对话及其附件仍可打开', async t => {
+  const app = await fixture(t);
+  const { upload } = await app.post('upload', { name: '共享.txt', data: 'eA==' });
+  const first = (await app.post('draft', { request: '同一工单', uploadIds: [upload.id] })).draft;
+  const next = (await app.post('revise', { id: first.id, instruction: '这份对话的修订' })).draft;
+  const other = (await app.post('draft', { request: '同一工单', uploadIds: [upload.id] })).draft;
+  const sent = await app.post('create', { id: next.id });
+  const alsoSent = await app.post('create', { id: other.id });
+  assert.equal(sent.issue.issueKey, alsoSent.issue.issueKey);
+  assert.deepEqual(first.target, other.target);
+  const callCount = app.seen.length;
+  const result = await app.post('draft/delete', { id: next.id });
+  assert.deepEqual(new Set(result.deletedIds), new Set([first.id, next.id]));
+  assert.deepEqual((await app.get('state')).drafts.map(draft => [draft.id, draft.submission.issueKey]), [[other.id, alsoSent.issue.issueKey]]);
+  assert.equal((await app.get(`history/${other.id}`)).messages[0].request, '同一工单');
+  assert.equal(await readFile(path.join(app.root, 'uploads', upload.id, upload.name), 'utf8'), 'x');
+  assert.equal(app.seen.length, callCount);
+});
+
+test('旧版独立对话共用编号时，只删除选中的版本链及其历史', async t => {
+  const app = await fixture(t);
+  const first = (await app.post('draft', { request: '删除这份', uploadIds: [] })).draft;
+  const next = (await app.post('revise', { id: first.id, instruction: '将被删除的修改' })).draft;
+  const other = (await app.post('draft', { request: '保留这份', uploadIds: [] })).draft;
+  const otherNext = (await app.post('revise', { id: other.id, instruction: '应保留的修改' })).draft;
+  const directory = path.join(app.root, 'conversations', first.rootId);
+  const otherDirectory = path.join(app.root, 'conversations', other.rootId);
+  for (const draft of [other, otherNext]) {
+    const file = path.join(app.root, 'drafts', `${draft.id}.json`);
+    const saved = JSON.parse(await readFile(file, 'utf8'));
+    await writeFile(file, JSON.stringify({ ...saved, webRootId: first.rootId }));
+    await rename(path.join(otherDirectory, `${draft.id}.json`), path.join(directory, `${draft.id}.json`));
+  }
+  const stopped = { request: '未完成的修改', baseId: first.id, createdAt: first.createdAt };
+  await saveJson(path.join(directory, 'stopped.json'), stopped);
+
+  const result = await app.post('draft/delete', { id: next.id });
+  assert.deepEqual(new Set(result.deletedIds), new Set([first.id, next.id]));
+  assert.equal(result.warning, undefined);
+  assert.deepEqual(new Set(await readdir(directory)), new Set([`${other.id}.json`, `${otherNext.id}.json`]));
+  assert.deepEqual((await app.get(`history/${otherNext.id}`)).messages.map(turn => turn.request), ['保留这份', '应保留的修改']);
+  assert.deepEqual(new Set((await app.get('state')).drafts.map(draft => draft.id)), new Set([other.id, otherNext.id]));
+  await app.post('draft/delete', { id: other.id });
+  await assert.rejects(readdir(directory), { code: 'ENOENT' });
+});
+
+test('对话编号仅大小写不同时，删除仍保留另一份历史', async t => {
+  const app = await fixture(t);
+  const first = (await app.post('draft', { request: '先创建的对话', conversationId: 'Shared-Root', uploadIds: [] })).draft;
+  const other = (await app.post('draft', { request: '要保留的对话', conversationId: 'shared-root', uploadIds: [] })).draft;
+  const result = await app.post('draft/delete', { id: first.id });
+  assert.deepEqual(result.deletedIds, [first.id]);
+  assert.equal(result.warning, undefined);
+  assert.deepEqual(await readdir(path.join(app.root, 'conversations', other.rootId)), [`${other.id}.json`]);
+  assert.deepEqual((await app.get(`history/${other.id}`)).messages.map(turn => turn.request), ['要保留的对话']);
+});
+
+test('共用目录的损坏记录会单独报告，其他已确认归属的记录仍会删除', async t => {
+  const app = await fixture(t);
+  const first = (await app.post('draft', { request: '删除这份', uploadIds: [] })).draft;
+  const other = (await app.post('draft', { request: '保留这份', uploadIds: [] })).draft;
+  const directory = path.join(app.root, 'conversations', first.rootId);
+  const otherFile = path.join(app.root, 'drafts', `${other.id}.json`);
+  const saved = JSON.parse(await readFile(otherFile, 'utf8'));
+  await writeFile(otherFile, JSON.stringify({ ...saved, webRootId: first.rootId }));
+  await rename(path.join(app.root, 'conversations', other.rootId, `${other.id}.json`), path.join(directory, `${other.id}.json`));
+  const broken = '0-interrupted.json';
+  await writeFile(path.join(directory, broken), '{invalid');
+  const unfinished = { request: '未完成的修改', baseId: first.id, createdAt: first.createdAt };
+  await saveJson(path.join(directory, 'stopped.json'), unfinished);
+
+  const result = await app.post('draft/delete', { id: first.id });
+  const pendingFiles = [`${first.rootId}/${broken}`];
+  assert.match(result.warning, /对话记录清理未完成/);
+  assert.deepEqual(result.pendingFiles, pendingFiles);
+  assert.deepEqual(new Set(await readdir(directory)), new Set([broken, `${other.id}.json`]));
+  assert.deepEqual(await app.post('history/cleanup'), { removed: 0, remaining: 1, pendingFiles });
+  await writeFile(path.join(directory, broken), JSON.stringify(unfinished));
+  assert.deepEqual(await app.post('history/cleanup'), { removed: 1, remaining: 0 });
+  assert.deepEqual((await app.get(`history/${other.id}`)).messages.map(turn => turn.request), ['保留这份']);
+  assert.deepEqual(await readdir(directory), [`${other.id}.json`]);
+});
+
+test('重复发送已保存的初稿请求时提示打开原草稿，不创建共享编号的对话', async t => {
+  const app = await fixture(t);
+  const body = { request: '已保存', uploadIds: [], conversationId: 'existing-chat' };
+  const { draft } = await app.post('draft', body);
+  const count = app.seen.length;
+  await assert.rejects(app.post('draft', body), { status: 409, message: /已保存.*新建对话/ });
+  assert.deepEqual((await app.get('state')).drafts.map(item => item.id), [draft.id]);
+  assert.equal(app.seen.length, count);
+});
+
+test('草稿目录不可写时删除失败，对话和所有草稿版本保留', {
+  skip: process.platform === 'win32' || process.getuid?.() === 0,
+}, async t => {
+  const app = await fixture(t);
+  const first = (await app.post('draft', { request: '首轮', uploadIds: [] })).draft;
+  const latest = (await app.post('revise', { id: first.id, instruction: '第二轮' })).draft;
+  const directory = path.join(app.root, 'drafts');
+  await chmod(directory, 0o500);
+  try {
+    await assert.rejects(app.post('draft/delete', { id: latest.id }), { code: 'EACCES' });
+    assert.deepEqual((await app.get(`history/${latest.id}`)).messages.map(turn => turn.request), ['首轮', '第二轮']);
+    assert.equal((await app.get('state')).drafts.length, 2);
+  } finally { await chmod(directory, 0o700); }
+  await app.post('draft/delete', { id: latest.id });
+  assert.equal((await app.get('storage')).pendingHistoryCleanup, 0);
+});
+
+test('对话清理失败后可在重启时重试，仍有草稿的对话不会被清理', async t => {
+  const app = await fixture(t);
+  const draft = (await app.post('draft', { request: '要删除的对话', uploadIds: [] })).draft;
+  const directory = path.join(app.root, 'conversations', draft.rootId);
+  const draftFile = path.join(app.root, 'drafts', `${draft.id}.json`);
+  const backup = await readFile(draftFile);
+  await rename(directory, directory + '.backup');
+  await writeFile(directory, '目录异常');
+  const result = await app.post('draft/delete', { id: draft.id });
+  assert.match(result.warning, /草稿已删除，但对话记录清理未完成/);
+  assert.equal((await app.get('state')).drafts.length, 0);
+  assert.equal(await readFile(directory, 'utf8'), '目录异常');
+
+  const restored = await createWebApp({ filename: app.filename });
+  t.after(() => restored.close());
+  const cleanup = () => restored.dispatch('POST', '/api/history/cleanup');
+  const storage = () => restored.dispatch('GET', '/api/storage');
+  assert.equal((await storage()).pendingHistoryCleanup, 1);
+  assert.deepEqual(await cleanup(), { removed: 0, remaining: 1 });
+  await rm(directory);
+  await rename(directory + '.backup', directory);
+  await writeFile(draftFile, backup);
+  assert.deepEqual(await cleanup(), { removed: 0, remaining: 1 });
+  assert.equal((await restored.dispatch('GET', `/api/history/${draft.id}`)).messages.length, 1);
+  await rm(draftFile);
+  assert.deepEqual(await cleanup(), { removed: 1, remaining: 0 });
+  await assert.rejects(readdir(directory), { code: 'ENOENT' });
+  assert.equal((await storage()).pendingHistoryCleanup, 0);
 });
 
 test('删除已提交或结果待确认的本地草稿保留提交锁，恢复旧稿也不能重复创建', async t => {
@@ -281,16 +504,31 @@ test('旧版没有webRootId的草稿与分支可一起删除，不留下失效�
   assert.equal((await app.get('state')).drafts.length, 0);
 });
 
-test('草稿删除成功但附件清理失败时返回明确警告，不清理目录异常条目', async t => {
+test('草稿删除成功但附件清理失败时记录附件范围，重启后只重试未被引用的目标附件', async t => {
   const app = await fixture(t);
-  const upload = (await app.post('upload', { name: '保留附件.txt', data: 'eA==' })).upload;
-  const draft = (await app.post('draft', { request: '删除', uploadIds: [upload.id] })).draft;
-  await writeFile(path.join(app.root, 'uploads', 'unexpected.txt'), '手工文件');
+  const add = async name => (await app.post('upload', { name, data: 'eA==' })).upload;
+  const unique = await add('独用.txt'), shared = await add('共享.txt'), pending = await add('待用.txt');
+  const uploadFile = ({ id, name }) => path.join(app.root, 'uploads', id, name);
+  const draft = (await app.post('draft', { request: '删除', uploadIds: [unique.id, shared.id] })).draft;
+  const unexpected = path.join(app.root, 'uploads', 'unexpected.txt');
+  await writeFile(unexpected, '手工文件');
   const result = await app.post('draft/delete', { id: draft.id });
   assert.match(result.warning, /草稿已删除，但附件清理未完成/);
   assert.equal((await app.get('state')).drafts.length, 0);
-  assert.equal(await readFile(path.join(app.root, 'uploads', upload.id, upload.name), 'utf8'), 'x');
-  assert.equal(await readFile(path.join(app.root, 'uploads', 'unexpected.txt'), 'utf8'), '手工文件');
+  assert.equal(await readFile(uploadFile(unique), 'utf8'), 'x');
+  assert.equal(await readFile(unexpected, 'utf8'), '手工文件');
+  assert.equal((await app.get('storage')).pendingHistoryCleanup, 1);
+  await app.post('draft', { request: '重试前引用共享附件', uploadIds: [shared.id] });
+  await app.close();
+  const restored = await createWebApp({ filename: app.filename });
+  t.after(() => restored.close());
+  const cleanup = () => restored.dispatch('POST', '/api/history/cleanup');
+  assert.deepEqual(await cleanup(), { removed: 0, remaining: 1 });
+  await rm(unexpected);
+  assert.deepEqual(await cleanup(), { removed: 1, remaining: 0 });
+  await assert.rejects(readFile(uploadFile(unique), 'utf8'), { code: 'ENOENT' });
+  for (const upload of [shared, pending]) assert.equal(await readFile(uploadFile(upload), 'utf8'), 'x');
+  assert.equal((await restored.dispatch('GET', '/api/storage')).pendingHistoryCleanup, 0);
 });
 
 test('已有未提交草稿显示和创建时清理模块空值尾巴，保留原文件和正文', async t => {
@@ -572,13 +810,79 @@ test('preview login prompt is acknowledged in web UI, creation is blocked until 
   assert.equal((await app.post('create', { id: draft.id })).issue.issueKey, 'DEMO-51');
 });
 
-test('web mutation concurrency cannot create duplicate requests during model generation', async t => {
+test('short web mutations retain the shared lock', async t => {
   let release;
   const waiting = new Promise(resolve => { release = resolve; });
   const app = await fixture(t, { folder: async () => { await waiting; return '/fixture'; } });
   const pending = app.post('folder');
   await assert.rejects(app.post('config/repo', { repo: '' }), /上一项操作/);
   release(); await pending;
+});
+
+test('两份草稿并行生成，停止、上下文和附件保护分别按任务处理', { timeout: 5000 }, async t => {
+  const bothStarted = Promise.withResolvers();
+  const waiting = new Map();
+  const response = report => json({ output: [{ type: 'message', content: [{ type: 'output_text',
+    text: JSON.stringify({ summary: report, description: '## 現状\n现有问题。\n\n## 期待\n显示正常。', unknowns: [] }) }] }] });
+  const app = await fixture(t, { fetchImpl: async (url, options) => {
+    const route = new URL(url).pathname;
+    if (route.endsWith('/issueTypes')) return json([{ name: 'Task', templateDescription: '## 現状\n\n## 期待' }]);
+    if (!route.endsWith('/responses')) return json({ projectKey: 'DEMO', textFormattingRule: 'markdown' });
+    const payload = JSON.parse(JSON.parse(options.body).input[0].content[0].text);
+    if (payload.report === '原始描述') return response(payload.report);
+    return new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+      waiting.set(payload.report, { payload, release: () => resolve(response(payload.report)) });
+      if (waiting.size === 2) bothStarted.resolve();
+    });
+  } });
+  const first = (await app.post('draft', { request: '原始描述', uploadIds: [] })).draft;
+  const { upload } = await app.post('upload', { name: '第二份附件.txt', data: 'eA==' });
+  const { upload: orphan } = await app.post('upload', { name: '未使用.txt', data: 'eA==' });
+  const revise = app.post('revise', { id: first.id, instruction: '停止这份修改', generationId: 'run-a' });
+  const stopped = assert.rejects(revise, /生成已停止/);
+  const body = { request: '第二份独立问题', uploadIds: [upload.id], conversationId: 'chat-b', generationId: 'run-b' };
+  const second = app.post('draft', body);
+  await bothStarted.promise;
+  const { generations } = await app.get('state');
+  const resumedA = generations.find(job => job.id === 'run-a');
+  const resumedB = generations.find(job => job.id === 'run-b');
+  assert.equal(resumedA.baseId, first.id);
+  assert.equal(resumedA.rootId, first.rootId);
+  assert.equal(resumedB.rootId, 'chat-b');
+  assert.deepEqual(resumedB.uploads, [upload]);
+  assert.equal(resumedB.request, body.request);
+  assert.equal((await app.get('activity/run-a')).running, true);
+  assert.equal((await app.get('activity/run-b')).running, true);
+  assert.deepEqual(waiting.get('停止这份修改').payload.conversation, { originalReport: '原始描述', recentRequests: [] });
+  assert.equal(waiting.get(body.request).payload.previousDraft, undefined);
+  await assert.rejects(app.post('generation/stop'), { status: 409 });
+  await assert.rejects(app.post('draft', { request: '第三份', uploadIds: [] }), /最多同时生成 2 份/);
+  await assert.rejects(app.post('draft/delete', { id: first.id }), /这份对话正在生成/);
+  await assert.rejects(app.post('create', { id: first.id }), /这份对话正在生成/);
+  await assert.rejects(app.post('uploads/remove', { ids: [upload.id] }), /正在用于生成/);
+  assert.equal((await app.post('storage/cleanup')).removedFiles, 1);
+  await assert.rejects(readFile(path.join(app.root, 'uploads', orphan.id, orphan.name)), { code: 'ENOENT' });
+  assert.equal(await readFile(path.join(app.root, 'uploads', upload.id, upload.name), 'utf8'), 'x');
+
+  assert.deepEqual(await app.post('generation/stop', { id: 'run-a' }), { stopping: true });
+  await stopped;
+  assert.equal((await app.get('activity/run-a')).activity.state, 'cancelled');
+  assert.equal((await app.get('activity/run-a')).running, false);
+  assert.equal((await app.get(`drafts/${resumedA.resultId}`)).draft, null);
+  assert.equal((await app.get('activity/run-b')).activity.state, 'running');
+  await assert.rejects(app.post('draft', { ...body, generationId: 'duplicate' }), /这份对话正在生成/);
+  waiting.get(body.request).release();
+  const { draft } = await second;
+  assert.equal(draft.rootId, 'chat-b');
+  assert.equal(draft.generationId, 'run-b');
+  assert.equal(resumedB.resultId, draft.id);
+  assert.deepEqual((await app.get(`drafts/${resumedB.resultId}`)).draft, draft);
+  assert.deepEqual((await app.get('state')).generations, []);
+  assert.deepEqual(draft.attachments, [{ name: upload.name }]);
+  assert.deepEqual((await app.get(`history/${draft.id}`)).messages.map(turn => turn.request), [body.request]);
+  assert.deepEqual((await app.get(`history/${first.id}`)).messages.map(turn => turn.request), ['原始描述', '停止这份修改']);
+  assert.equal((await app.get('activity/run-b')).activity.state, 'complete');
 });
 
 test('网页生成详情在等待中可读，失败费用计入同一对话，恢复和字段编辑不重复计费', async t => {
@@ -617,11 +921,13 @@ test('网页生成详情在等待中可读，失败费用计入同一对话，�
 
 test('生成忙碌时仍可停止，原稿保留、未知用量不记零，停止后可继续修改', async t => {
   let block = false, started;
+  let sent;
   const beginning = new Promise(resolve => { started = resolve; });
   const app = await fixture(t, { fetchImpl: async (url, options) => {
     const route = new URL(url).pathname;
     if (route.endsWith('/issueTypes')) return json([{ name: 'Task', templateDescription: '## 現状\n\n## 期待' }]);
     if (options.method === 'POST') {
+      sent = JSON.parse(JSON.parse(options.body).input[0].content[0].text);
       if (block) { started(); return new Promise((_resolve, reject) => { options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }); }); }
       return json({ usage: { input_tokens: 10, output_tokens: 5 }, output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ summary: '保留原稿', description: '## 現状\n菜单异常。\n\n## 期待\n显示一致。', unknowns: [] }) }] }] });
     }
@@ -636,12 +942,14 @@ test('生成忙碌时仍可停止，原稿保留、未知用量不记零，停�
   assert.equal((await app.post('generation/stop')).stopping, true);
   await stopped;
   assert.equal((await app.get('activity')).activity.state, 'cancelled');
+  assert.deepEqual((await app.get(`history/${first.id}`)).messages.map(turn => [turn.request, turn.draftId]), [['问题', first.id], ['调查源码', undefined]]);
   assert.deepEqual((await app.get('state')).drafts.map(draft => draft.id), [first.id]);
   const usage = (await app.get(`usage/${first.rootId}`)).conversation;
   assert.equal(usage.requests, 2); assert.equal(usage.totalTokens, 15); assert.equal(usage.missingTokens, 1);
   assert.equal((await app.post('generation/stop')).stopping, false);
   block = false;
   const next = (await app.post('revise', { id: first.id, instruction: '只改标题' })).draft;
+  assert.deepEqual(sent.conversation, { originalReport: '问题', recentRequests: [] });
   assert.equal(next.rootId, first.rootId); assert.equal((await app.get('activity')).activity.state, 'complete');
 });
 

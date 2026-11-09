@@ -6,7 +6,7 @@ import { selectedEffort } from './models.js';
 
 const validId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,120}$/.test(value);
 function generationView(run) {
-  return { id: run.id, rootId: run.rootId, model: run.model, reasoningEffort: run.reasoningEffort, state: run.state, retrying: Boolean(run.retrying), startedAt: run.startedAt, events: run.events, thoughts: run.thoughts, thoughtsTruncated: run.thoughtsTruncated, usage: sumUsage(run.rounds), error: run.error };
+  return { id: run.id, rootId: run.rootId, model: run.model, reasoningEffort: run.reasoningEffort, state: run.state, retrying: Boolean(run.retrying), startedAt: run.startedAt, events: run.events, thoughts: run.thoughts, thoughtsTruncated: run.thoughtsTruncated, usage: sumUsage(run.rounds), error: run.error, warning: run.warning };
 }
 
 export async function startGeneration(directory, id, rootId, config, env) {
@@ -32,7 +32,7 @@ export async function startGeneration(directory, id, rootId, config, env) {
       }
       await persist();
     },
-    async finish(error) { run.state = error?.name === 'AbortError' ? 'cancelled' : error ? 'error' : 'complete'; run.retrying = false; if (error) run.error = error.code ? '本地操作未完成' : error.message; await persist(); },
+    async finish(error, warning) { run.state = error?.name === 'AbortError' ? 'cancelled' : error ? 'error' : 'complete'; run.retrying = false; if (error) run.error = error.code ? '本地操作未完成' : error.message; run.warning = warning; await persist(); },
   };
 }
 

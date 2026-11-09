@@ -58,12 +58,12 @@ export async function uploadStorage(dataDir) {
   return (await inspect(dataDir)).storage;
 }
 
-export async function cleanUploads(dataDir, { ids, keepIds = [], keepReferenced = false } = {}) {
-  if ((ids && (!Array.isArray(ids) || ids.some(id => !uploadId(id)))) || !Array.isArray(keepIds) || keepIds.length > 10 || keepIds.some(id => !uploadId(id))) throw new Error('附件编号无效');
+export async function cleanUploads(dataDir, { ids, keepIds = [], keepReferenced = false, pinnedIds = [] } = {}) {
+  if ((ids && (!Array.isArray(ids) || ids.some(id => !uploadId(id)))) || !Array.isArray(keepIds) || keepIds.some(id => !uploadId(id))) throw new Error('附件编号无效');
   const { storage, groups, referenced } = await inspect(dataDir);
   if (storage.blocked) throw new Error('有草稿无法检查或附件目录包含异常条目，已停止清理，避免误删');
   if (!keepReferenced && ids?.some(id => referenced.has(id.toLowerCase()))) throw new Error('附件仍被已保存草稿引用，已保留');
-  const keep = new Set([...referenced, ...keepIds.map(id => id.toLowerCase())]), selected = ids ? new Set(ids.map(id => id.toLowerCase())) : null;
+  const keep = new Set([...referenced, ...keepIds.map(id => id.toLowerCase()), ...pinnedIds]), selected = ids ? new Set(ids.map(id => id.toLowerCase())) : null;
   let freedBytes = 0, removedFiles = 0;
   for (const group of groups.values()) {
     if (keep.has(group.id) || (selected && !selected.has(group.id))) continue;

@@ -21,7 +21,16 @@ import { attachmentImages, inlineImageDescription, rewriteImageReferences } from
 const exec = promisify(execFile);
 const assetRoot = fileURLToPath(new URL('../web/', import.meta.url));
 const validId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,120}$/.test(value);
+const revisionParentId = value => {
+  if (typeof value !== 'string' || !value.endsWith('.json')) return;
+  const id = path.win32.basename(value, '.json');
+  if (validId(id) && (value === `${id}.json` || (path.win32.isAbsolute(value) && path.win32.basename(path.win32.dirname(value)) === 'drafts'))) return id;
+};
+const historyReadWarning = '有对话记录无法读取，已保留可用记录。';
+const historyCleanupSuffix = '.conversation-cleanup';
 const userError = message => Object.assign(new Error(message), { status: 400 });
+const conflict = message => Object.assign(userError(message), { status: 409 });
+const maxGenerations = 2;
 const text = (value, label, limit = 40_000) => {
   if (typeof value !== 'string' || !value.trim() || value.length > limit) throw userError(`${label}不能为空，且不能超过 ${limit} 字符`);
   return value.trim();
@@ -44,7 +53,14 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
   const lifecycle = new AbortController();
   const fetchSafe = (url, options = {}) => fetchImpl(url, { ...options, signal: options.signal ? AbortSignal.any([lifecycle.signal, options.signal]) : lifecycle.signal });
   const deps = { fetchImpl: fetchSafe, env, signal: lifecycle.signal };
-  let busy = false, previewSession = null, generation = null, generationController = null;
+  let busy = false, previewSession = null, generation = null, generationStart = Promise.resolve();
+  const jobs = new Map();
+  const pinnedUploads = () => [...jobs.values()].flatMap(job => job.uploadIds);
+  const ensureIdle = rootId => {
+    if ([...jobs.values()].some(job => job.rootId.toLowerCase() === rootId.toLowerCase())) {
+      throw conflict('这份对话正在生成，请等待完成或停止后再操作');
+    }
+  };
   const newId = () => `${Date.now()}-${randomUUID().slice(0, 8)}`;
   const config = () => loadConfig(filename, { allowMissing: true });
   const safeUrl = (value, originOnly = false) => { try { return httpUrl(value, '地址', { originOnly }); } catch { return ''; } };
@@ -57,16 +73,182 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
       backlogOrigin: safeUrl(c.backlog?.origin, true), project: c.backlog?.project || '', issueType: selectedProjectType(c.backlog) || '', category: selectedProjectCategory(c.backlog) || '', backlogKeyConfigured, repo: selectedProjectRepo(c) || '', language: c.language || 'zh-CN' };
   };
   const draftFile = id => { if (!validId(id)) throw userError('草稿编号无效'); return path.join(draftDir, `${id}.json`); };
+  const conversationDir = async rootId => {
+    const parent = path.join(dataDir, 'conversations'), directory = path.join(parent, rootId);
+    for (const location of [parent, directory]) {
+      const entry = await lstat(location).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      if (entry && !entry.isDirectory()) throw userError('本机对话记录目录无效');
+    }
+    return directory;
+  };
   const handle = async id => {
     const file = draftFile(id), draft = await readDraft(file);
-    let rootId = id, parent = draft, visited = new Set([id]);
+    let rootId = id;
     if (validId(draft.webRootId)) rootId = draft.webRootId;
-    else while (parent.revisionOf && path.dirname(path.resolve(parent.revisionOf)) === draftDir) {
-      const next = path.basename(parent.revisionOf, '.json');
-      if (!validId(next) || visited.has(next) || visited.size > 100) throw userError('草稿版本关联无效');
-      visited.add(next); rootId = next; parent = await readDraft(draftFile(next));
+    else {
+      const visited = new Set([id]);
+      let parentId = revisionParentId(draft.revisionOf);
+      while (parentId) {
+        if (visited.has(parentId) || visited.size > 100) throw userError('草稿版本关联无效');
+        visited.add(parentId);
+        rootId = parentId;
+        parentId = revisionParentId((await readDraft(draftFile(parentId))).revisionOf);
+      }
     }
     return { id, rootId, filename: file, receiptFile: `${draftFile(rootId)}.submission.json`, draft };
+  };
+  const mutableDraft = async id => {
+    const item = await handle(id);
+    ensureIdle(item.rootId);
+    return item;
+  };
+  const draftEntries = () => readdir(draftDir).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
+  const checkedDrafts = async (entries, { ignoreInvalid = false } = {}) => {
+    const drafts = [];
+    for (const name of entries.filter(name => /^[a-zA-Z0-9_-]+\.json$/.test(name))) {
+      try { drafts.push(await handle(name.slice(0, -5))); }
+      catch {
+        if (!ignoreInvalid) throw userError('有草稿版本无法检查，已停止删除，请先检查本机草稿记录');
+      }
+    }
+    return drafts;
+  };
+  const pendingHistoryCleanup = entries => entries.filter(name => name.endsWith(historyCleanupSuffix))
+    .map(name => name.slice(0, -historyCleanupSuffix.length)).filter(validId);
+  const cleanupMarker = id => path.join(draftDir, id + historyCleanupSuffix);
+  const directoryEntry = filename => lstat(filename, { bigint: true }).catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  const removeConversationHistory = async (rootId, deleted, liveDrafts) => {
+    const directory = await conversationDir(rootId);
+    const actual = await directoryEntry(directory);
+    if (!actual) return { pending: false };
+    const rootIds = new Set(liveDrafts.map(item => item.rootId));
+    let shared = rootIds.has(rootId);
+    if (!shared) {
+      // Case variants can name the same directory on macOS and Windows.
+      for (const other of rootIds) {
+        if (other.toLowerCase() !== rootId.toLowerCase()) continue;
+        const alias = await directoryEntry(path.join(path.dirname(directory), other));
+        if (alias?.isDirectory() && (!actual.ino || !alias.ino || (alias.dev === actual.dev && alias.ino === actual.ino))) {
+          shared = true;
+          break;
+        }
+      }
+    }
+    if (!shared) {
+      await rm(directory, { recursive: true, force: true });
+      return { pending: false };
+    }
+    if (!deleted.size) return { pending: true };
+
+    // In a shared directory, unreadable turns must not block known deletions.
+    const live = new Set(liveDrafts.map(item => item.id));
+    const pendingFiles = [];
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const id = entry.name.slice(0, -5);
+      if (!entry.isFile() || !entry.name.endsWith('.json') || !validId(id) || live.has(id)) continue;
+      const file = path.join(directory, entry.name);
+      try {
+        if (deleted.has(id)) {
+          await rm(file, { force: true });
+        } else {
+          const baseId = JSON.parse(await readFile(file, 'utf8'))?.baseId;
+          if (deleted.has(baseId)) await rm(file, { force: true });
+          else if (baseId !== null && !validId(baseId)) pendingFiles.push(`${rootId}/${entry.name}`);
+        }
+      } catch (error) {
+        if (error.code !== 'ENOENT') pendingFiles.push(`${rootId}/${entry.name}`);
+      }
+    }
+    return { pending: pendingFiles.length > 0, pendingFiles };
+  };
+  const finishDeletion = async (markerId, liveDrafts) => {
+    const marker = cleanupMarker(markerId);
+    if (!(await lstat(marker)).isFile()) throw userError('对话清理记录无效');
+    const raw = await readFile(marker, 'utf8');
+    // Old markers may omit the attachment IDs or only name the root.
+    const { rootId, draftIds, attachmentIds = [] } = raw ? JSON.parse(raw) : { rootId: markerId, draftIds: [] };
+    if (!validId(rootId) || !Array.isArray(draftIds) || draftIds.some(id => !validId(id))
+      || !Array.isArray(attachmentIds) || attachmentIds.some(id => !uploadId(id))) throw userError('对话清理记录无效');
+    const result = { historyPending: true, attachmentsPending: attachmentIds.length > 0, freedBytes: 0, removedFiles: 0 };
+    const deleted = new Set(draftIds);
+    if (liveDrafts.some(item => deleted.has(item.id))) return result;
+    try {
+      const { pending, pendingFiles } = await removeConversationHistory(rootId, deleted, liveDrafts);
+      Object.assign(result, { historyPending: pending, pendingFiles });
+    }
+    catch { /* Keep this work pending while the history directory is unavailable. */ }
+    if (attachmentIds.length) {
+      try {
+        const { freedBytes, removedFiles } = await cleanUploads(dataDir, { ids: attachmentIds, keepReferenced: true, pinnedIds: pinnedUploads() });
+        Object.assign(result, { attachmentsPending: false, freedBytes, removedFiles });
+      } catch { /* Retry with the same IDs and recheck references. */ }
+    }
+    if (!result.historyPending && !result.attachmentsPending) {
+      try { await rm(marker, { force: true }); }
+      catch { result.historyPending = true; }
+    }
+    return result;
+  };
+  const conversationHistory = async (selected, includeUnfinished = false) => {
+    let directory, entries, warning;
+    try {
+      directory = await conversationDir(selected.rootId);
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      return { messages: [], warning: error.code === 'ENOENT' ? undefined : historyReadWarning };
+    }
+    const files = entries.filter(entry => entry.isFile()).map(entry => entry.name);
+    if (!files.length) return { messages: [] };
+    const versions = new Map();
+    let version = selected;
+    while (version.rootId === selected.rootId && !versions.has(version.id)) {
+      versions.set(version.id, version.draft);
+      const id = revisionParentId(version.draft.revisionOf);
+      if (!id) break;
+      try { version = await handle(id); }
+      catch { warning = historyReadWarning; break; }
+    }
+    const until = new Map();
+    let next = null;
+    for (const [id, draft] of versions) {
+      until.set(id, next);
+      next = draft.createdAt;
+    }
+    const completed = new Map(), unfinished = new Map();
+    for (const file of files.sort()) {
+      const id = file.slice(0, -5);
+      if (!file.endsWith('.json') || !validId(id) || (!includeUnfinished && !versions.has(id))) continue;
+      let saved;
+      try { saved = JSON.parse(await readFile(path.join(directory, file), 'utf8')); }
+      catch { warning = historyReadWarning; continue; }
+      const { request, baseId, createdAt } = saved ?? {};
+      if (typeof request !== 'string' || typeof createdAt !== 'string' || (baseId !== null && !validId(baseId))) {
+        warning = historyReadWarning; continue;
+      }
+      const turn = { request, baseId, createdAt };
+      const draft = versions.get(id);
+      if (draft) {
+        completed.set(id, { ...turn, draftId: id, summary: draft.summary });
+      } else if (until.has(baseId) && (until.get(baseId) === null || createdAt <= until.get(baseId))) {
+        const hasDraft = await lstat(draftFile(id)).then(() => true, error => {
+          if (error.code === 'ENOENT') return false;
+          warning = historyReadWarning; return true;
+        });
+        if (!hasDraft) {
+          if (!unfinished.has(baseId)) unfinished.set(baseId, []);
+          unfinished.get(baseId).push(turn);
+        }
+      }
+    }
+    const messages = [];
+    for (const id of [...versions.keys()].reverse()) {
+      if (completed.has(id)) messages.push(completed.get(id));
+      if (unfinished.has(id)) messages.push(...unfinished.get(id));
+    }
+    return { messages, warning };
   };
   const dto = async item => {
     let submission = null, submittedSummary;
@@ -79,11 +261,11 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
     const { summary: rawSummary, description, unknowns, target, issueType, category, language, assignee, startDate, dueDate, notifiedUsers = [], createdAt, revisionOf } = withDefaultSchedule(item.draft);
     const normalizedSummary = categorySummary(rawSummary, category);
     const summary = !submission || submittedSummary === normalizedSummary ? normalizedSummary : rawSummary;
-    return { id: item.id, rootId: item.rootId, summary, description, unknowns, target, issueType, category, language, assignee, startDate, dueDate, notifiedUsers, createdAt, generationId: validId(item.draft.generationId) ? item.draft.generationId : undefined, revisionOf: revisionOf ? path.basename(revisionOf, '.json') : undefined,
+    return { id: item.id, rootId: item.rootId, summary, description, unknowns, target, issueType, category, language, assignee, startDate, dueDate, notifiedUsers, createdAt, generationId: validId(item.draft.generationId) ? item.draft.generationId : undefined, revisionOf: revisionParentId(revisionOf),
       attachments: item.draft.attachments.map(file => ({ name: path.basename(file) })), submission };
   };
   const recent = async () => {
-    const files = await readdir(draftDir).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
+    const files = await draftEntries();
     const result = [];
     for (const file of files.filter(file => /^[a-zA-Z0-9_-]+\.json$/.test(file)).sort().reverse().slice(0, 50)) {
       try { result.push(await dto(await handle(file.slice(0, -5)))); } catch { /* Skip unrelated or invalid drafts. */ }
@@ -93,7 +275,7 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
   const previewState = () => previewSession ? { id: previewSession.id, state: previewSession.state, prompt: previewSession.prompt, logs: previewSession.logs, error: previewSession.error, issue: previewSession.issue } : null;
   const saveDraft = async (draft, previous, id = newId(), rootId) => {
     draft.webRootId = previous?.rootId || rootId || id;
-    if (previous) draft.revisionOf = previous.filename;
+    if (previous) draft.revisionOf = `${previous.id}.json`;
     await saveJson(draftFile(id), draft);
     return dto(await handle(id));
   };
@@ -187,16 +369,32 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
     return { preview: previewState() };
   };
   const route = async (method, route, body = {}) => {
-    if (method === 'GET' && route === '/api/state') return { config: await snapshot(), drafts: await recent(), defaults: defaultSchedule(), languages: ticketLanguages, effortLabels, preview: previewState() };
+    if (method === 'GET' && route === '/api/state') {
+      await generationStart;
+      // Take this snapshot before reading drafts so a finishing job is visible in at least one list.
+      const generations = [...jobs.values()].map(job => ({ id: job.id, rootId: job.rootId, ...job.resume, stopping: job.controller?.signal.aborted ?? false }));
+      return { config: await snapshot(), drafts: await recent(), generations, defaults: defaultSchedule(), languages: ticketLanguages, effortLabels, preview: previewState() };
+    }
     if (method === 'GET' && route === '/api/preview') return { preview: previewState() };
     if (method === 'GET' && route === '/api/activity') return { activity: generation?.view() || null };
+    if (method === 'GET' && route.startsWith('/api/history/')) {
+      return conversationHistory(await handle(route.slice('/api/history/'.length)), true);
+    }
+    if (method === 'GET' && route.startsWith('/api/drafts/')) {
+      const item = await handle(route.slice('/api/drafts/'.length)).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      return { draft: item && await dto(item) };
+    }
     if (method === 'GET' && route.startsWith('/api/activity/')) {
       const id = route.slice('/api/activity/'.length);
-      return { activity: generation?.id === id ? generation.view() : await savedGeneration(dataDir, id) };
+      const job = jobs.get(id);
+      return { running: Boolean(job), activity: job?.activity?.view() || await savedGeneration(dataDir, id) };
     }
     if (method === 'GET' && route.startsWith('/api/usage/')) return recordedUsage(dataDir, route.slice('/api/usage/'.length), await config(), env);
     if (method === 'GET' && route === '/api/account') return { account: await accountUsage(await config(), deps) };
-    if (method === 'GET' && route === '/api/storage') return { storage: await uploadStorage(dataDir) };
+    if (method === 'GET' && route === '/api/storage') return { storage: await uploadStorage(dataDir), pendingHistoryCleanup: pendingHistoryCleanup(await draftEntries()).length };
     if (method === 'GET' && route === '/api/models') {
       const options = await listModelOptions(await config(), deps);
       return { models: options.map(model => model.id), options };
@@ -207,9 +405,11 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
     if (method === 'GET' && route === '/api/users') return { users: await listProjectUsers(await config(), deps) };
     if (method !== 'POST') throw Object.assign(new Error('页面或操作不存在'), { status: 404 });
     if (route === '/api/generation/stop') {
-      const stopping = Boolean(generationController);
-      generationController?.abort();
-      return { stopping };
+      if (body.id != null && !validId(body.id)) throw userError('生成编号无效');
+      if (body.id == null && jobs.size > 1) throw conflict('有多份草稿正在生成，请选择要停止的对话');
+      const job = body.id == null ? jobs.values().next().value : jobs.get(body.id);
+      job?.controller?.abort();
+      return { stopping: Boolean(job?.controller) };
     }
     if (route === '/api/preview/continue') {
       if (previewSession?.state !== 'waiting' || !previewSession.acknowledge) throw userError('官网当前没有等待继续的填写操作');
@@ -220,38 +420,74 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
       if (previewSession) previewSession.state = 'closed';
       return { preview: previewState() };
     }
-    if (busy) throw Object.assign(userError('上一项操作仍在进行，请稍候'), { status: 409 });
-    busy = true;
+    const generatingDraft = route === '/api/draft' || route === '/api/revise';
+    let releaseStart, ownsLock = false, job;
+    if (generatingDraft) {
+      // Serialize only the setup that reserves a conversation and its attachments.
+      const previousStart = generationStart;
+      generationStart = new Promise(resolve => { releaseStart = resolve; });
+      await previousStart;
+    }
     try {
-      if (route === '/api/storage/cleanup') return await cleanUploads(dataDir, { keepIds: body.keepIds ?? [] });
+      lifecycle.signal.throwIfAborted();
+      if (busy) throw conflict('上一项操作仍在进行，请稍候');
+      busy = ownsLock = true;
+      if (route === '/api/storage/cleanup') return await cleanUploads(dataDir, { keepIds: body.keepIds ?? [], pinnedIds: pinnedUploads() });
+      if (route === '/api/history/cleanup') {
+        const entries = await draftEntries(), pending = pendingHistoryCleanup(entries);
+        if (!pending.length) return { removed: 0, remaining: 0 };
+        const live = await checkedDrafts(entries);
+        const pendingFiles = new Set();
+        let removed = 0;
+        for (const markerId of pending) {
+          try {
+            const { historyPending, attachmentsPending, pendingFiles: files } = await finishDeletion(markerId, live);
+            for (const file of files || []) pendingFiles.add(file);
+            if (!historyPending && !attachmentsPending) removed++;
+          }
+          catch { /* Keep the marker for the next cleanup attempt. */ }
+        }
+        return { removed, remaining: pending.length - removed, ...(pendingFiles.size && { pendingFiles: [...pendingFiles] }) };
+      }
       if (route === '/api/uploads/remove') {
         if (!Array.isArray(body.ids) || body.ids.length > 10) throw userError('附件编号无效');
+        const pinned = new Set(pinnedUploads());
+        if (body.ids.some(id => typeof id === 'string' && pinned.has(id.toLowerCase()))) throw conflict('附件正在用于生成草稿，请稍后再移除');
         return await cleanUploads(dataDir, { ids: body.ids });
       }
       if (route === '/api/draft/delete') {
         if (previewSession?.active) throw userError('请先关闭官网预览，再删除草稿');
-        const selected = await handle(body.id), family = [];
-        for (const file of (await readdir(draftDir)).filter(file => /^[a-zA-Z0-9_-]+\.json$/.test(file))) {
-          let item;
-          try { item = await handle(file.slice(0, -5)); }
-          catch { throw userError('有草稿版本无法检查，已停止删除，请先检查本机草稿记录'); }
-          if (item.rootId === selected.rootId) family.push(item);
+        const selected = await mutableDraft(body.id);
+        const candidates = new Map((await checkedDrafts(await draftEntries())).filter(item => item.rootId === selected.rootId).map(item => [item.id, item]));
+        let first = selected;
+        const ancestors = new Set([first.id]);
+        for (let parent; (parent = candidates.get(revisionParentId(first.draft.revisionOf))); first = parent) {
+          if (ancestors.has(parent.id)) throw userError('草稿版本关联成环，已停止删除');
+          ancestors.add(parent.id);
         }
-        // Remove children first so an interrupted deletion leaves usable parents.
-        const remaining = [...family], ordered = [];
-        while (remaining.length) {
-          const parents = new Set(remaining.filter(item => typeof item.draft.revisionOf === 'string').map(item => path.resolve(item.draft.revisionOf)));
-          const index = remaining.findIndex(item => !parents.has(item.filename));
-          if (index < 0) throw userError('草稿版本关联成环，已停止删除');
-          ordered.push(remaining.splice(index, 1)[0]);
+        const children = new Map();
+        for (const item of candidates.values()) {
+          const parent = revisionParentId(item.draft.revisionOf);
+          if (!parent) continue;
+          if (!children.has(parent)) children.set(parent, []);
+          children.get(parent).push(item);
         }
+        const family = [first];
+        for (const item of family) family.push(...(children.get(item.id) || []));
         const physicalUploadDir = await realpath(uploadDir).catch(error => { if (error.code === 'ENOENT') return uploadDir; throw error; });
-        const ids = [...new Set(family.flatMap(item => item.draft.attachments).flatMap(file => [uploadDir, physicalUploadDir].map(directory => path.relative(directory, file).split(path.sep)[0])).filter(uploadId))];
-        for (const item of ordered) await unlink(item.filename);
-        let cleanup = { freedBytes: 0, removedFiles: 0 };
-        try { cleanup = await cleanUploads(dataDir, { ids, keepReferenced: true }); }
-        catch { cleanup.warning = '草稿已删除，但附件清理未完成，请在配置工作台检查附件存储。'; }
-        return { rootId: selected.rootId, deletedIds: family.map(item => item.id), freedBytes: cleanup.freedBytes, removedFiles: cleanup.removedFiles, warning: cleanup.warning };
+        const attachmentIds = [...new Set(family.flatMap(item => item.draft.attachments).flatMap(file => [uploadDir, physicalUploadDir].map(directory => path.relative(directory, file).split(path.sep)[0])).filter(uploadId))];
+        // Record cleanup before deleting versions so an interrupted deletion can be retried.
+        const markerId = newId(), deletedIds = family.map(item => item.id);
+        await saveJson(cleanupMarker(markerId), { rootId: selected.rootId, draftIds: deletedIds, attachmentIds });
+        // Remove children first so an interrupted deletion leaves usable parents.
+        for (const item of family.reverse()) await unlink(item.filename);
+        const warnings = [];
+        let cleanup = { historyPending: true, attachmentsPending: attachmentIds.length > 0, freedBytes: 0, removedFiles: 0 };
+        try { cleanup = await finishDeletion(markerId, await checkedDrafts(await draftEntries())); }
+        catch { /* Keep the marker for the next cleanup attempt. */ }
+        if (cleanup.historyPending) warnings.push('草稿已删除，但对话记录清理未完成。可在配置工作台重试。');
+        if (cleanup.attachmentsPending) warnings.push('草稿已删除，但附件清理未完成。可在配置工作台重试。');
+        return { rootId: selected.rootId, deletedIds, freedBytes: cleanup.freedBytes, removedFiles: cleanup.removedFiles, warning: warnings.join(' ') || undefined, ...(cleanup.pendingFiles?.length && { pendingFiles: cleanup.pendingFiles }) };
       }
       if (route === '/api/folder') return { repo: await folder() };
       if (route === '/api/config/language') {
@@ -304,7 +540,7 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
         if (typeof body.category !== 'string') throw userError('请选择项目列表中的分类');
         if (previewSession?.active && body.id) throw userError('请先关闭官网预览，再修改草稿分类');
         const c = await config();
-        const item = body.id ? await handle(body.id) : null;
+        const item = body.id ? await mutableDraft(body.id) : null;
         if (item) {
           await ensureUnsubmitted(item);
           if (item.draft.target?.origin !== c.backlog?.origin || item.draft.target?.project !== c.backlog?.project) throw userError('请先切回草稿对应的 Backlog 站点与项目，再选择分类');
@@ -343,7 +579,7 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
       }
       if (route === '/api/draft/edit') {
         if (previewSession?.active) throw userError('请先关闭官网预览，再编辑草稿');
-        const item = await handle(body.id); await ensureUnsubmitted(item);
+        const item = await mutableDraft(body.id); await ensureUnsubmitted(item);
         const { draft, inlineImages } = await editDraft(item.draft, body);
         if (inlineImages?.length) draft.description = inlineImageDescription(draft.description, inlineImages, draft.textFormattingRule);
         text(draft.description, '正文');
@@ -356,7 +592,7 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
       if (route === '/api/fields') {
         if (body.assignee != null && typeof body.assignee !== 'string') throw userError('负责人必须为项目成员姓名，或留空');
         if (previewSession?.active) throw userError('请先关闭官网预览，再修改日期和人员');
-        const item = await handle(body.id); await ensureUnsubmitted(item);
+        const item = await mutableDraft(body.id); await ensureUnsubmitted(item);
         const c = await config();
         if (item.draft.target?.origin !== c.backlog?.origin || item.draft.target?.project !== c.backlog?.project) throw userError('请先切回草稿对应的 Backlog 站点与项目，再修改日期和人员');
         const draft = withDefaultSchedule({ ...item.draft, startDate: body.startDate, dueDate: body.dueDate, notifiedUsers: body.notifiedUsers ?? [], createdAt: new Date().toISOString() });
@@ -369,17 +605,19 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
         }
         return { draft: await saveDraft(draft, item) };
       }
-      if (route === '/api/draft' || route === '/api/revise') {
-        const controller = generationController = new AbortController();
+      if (generatingDraft) {
+        if (jobs.size >= maxGenerations) throw conflict(`最多同时生成 ${maxGenerations} 份草稿，请等待其中一份完成`);
+        const controller = new AbortController();
         const signal = AbortSignal.any([lifecycle.signal, controller.signal]);
         const c = await config();
-        const previous = route === '/api/revise' ? await handle(body.id) : null;
+        const previous = route === '/api/revise' ? await mutableDraft(body.id) : null;
         if (previous) await ensureUnsubmitted(previous);
         if (previous && previewSession?.active) throw userError('请先关闭官网预览，再修改草稿');
         let before = previous?.draft;
         let images = [], attachments = [];
+        const newUploads = previous ? new Map() : await readUploads(body.uploadIds);
         if (!previous) {
-          for (const upload of (await readUploads(body.uploadIds)).values()) (upload.image ? images : attachments).push(upload.file);
+          for (const upload of newUploads.values()) (upload.image ? images : attachments).push(upload.file);
         } else {
           attachments = before.attachments;
         }
@@ -394,9 +632,51 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
         const request = text(previous ? body.instruction : body.request, previous ? '修改要求' : '问题描述');
         if (body.conversationId != null && !validId(body.conversationId)) throw userError('对话编号无效');
         const id = newId(), rootId = previous?.rootId || body.conversationId || id;
-        const active = generation = await startGeneration(dataDir, id, rootId, c, env);
+        const generationId = body.generationId ?? id;
+        if (!validId(generationId)) throw userError('生成编号无效');
+        ensureIdle(rootId);
+        if (jobs.has(generationId)) throw conflict('这次生成已开始');
+        if (!previous && body.conversationId) {
+          const entries = await draftEntries();
+          const drafts = await checkedDrafts(entries, { ignoreInvalid: true });
+          if (drafts.some(item => item.rootId === rootId) || entries.includes(`${rootId}.json.submission.json`)) {
+            throw Object.assign(userError('这次对话已有已保存的草稿或提交记录。请打开原草稿继续操作，或新建对话。'), { status: 409 });
+          }
+        }
+        const turn = { request, baseId: previous?.id || null, createdAt: new Date().toISOString() };
+        const { messages: history, warning: readWarning } = previous ? await conversationHistory(previous) : { messages: [] };
+        let turnFile, writeWarning;
+        const saveTurn = async () => {
+          try {
+            const file = path.join(await conversationDir(rootId), `${id}.json`);
+            await saveJson(file, turn);
+            turnFile = file;
+          } catch { writeWarning = '本次对话未能保存，请检查本机对话记录目录。'; }
+        };
+        const originalReport = history.find(turn => turn.baseId === null)?.request.slice(0, 12_000);
+        const recentRequests = history.filter(turn => turn.baseId !== null).slice(-4).map(turn => turn.request.slice(0, 2_000));
+        const conversation = originalReport || recentRequests.length ? { originalReport, recentRequests } : undefined;
+        signal.throwIfAborted();
+        let resolveDone;
+        const done = new Promise(resolve => { resolveDone = resolve; });
+        const uploadIds = previous ? (body.edit?.files || []).map(file => file.id).filter(uploadId) : [...newUploads.keys()];
+        const resume = {
+          resultId: id, baseId: previous?.id, request,
+          uploads: [...newUploads].map(([id, { file, image }]) => ({ id, name: path.basename(file), image })),
+          issueFields: previous ? null : { startDate: body.startDate, dueDate: body.dueDate, assignee: body.assignee, notifiedUsers: body.notifiedUsers },
+          edit: attachmentEdit ? { summary: body.edit.summary, description: body.edit.description } : undefined,
+          editFiles: attachmentEdit ? body.edit.files.map(({ id, index, replaces }, position) => ({ id, index, replaces, name: path.basename(attachments[position]), image: images.includes(attachments[position]) })) : [],
+        };
+        job = { id: generationId, rootId, controller, uploadIds: uploadIds.map(id => id.toLowerCase()), resume, done, resolveDone };
+        jobs.set(generationId, job);
+        const active = job.activity = generation = await startGeneration(dataDir, generationId, rootId, c, env);
+        busy = ownsLock = false;
+        releaseStart();
+        releaseStart = null;
         try {
-          const generated = await generateDraft(c, { request, previousDraft: before, language: body.language, repo: attachmentEdit ? '' : undefined,
+          signal.throwIfAborted();
+          if (previous) await saveTurn();
+          const generated = await generateDraft(c, { request, previousDraft: before, conversation, language: body.language, repo: attachmentEdit ? '' : undefined,
             images, attachments, issueType: before?.issueType, assignee: before ? before.assignee : body.assignee || undefined, startDate: before ? before.startDate : body.startDate, dueDate: before ? before.dueDate : body.dueDate, notifiedUsers: before ? before.notifiedUsers : body.notifiedUsers }, { fetchImpl: fetchSafe, env, log: active.log, onEvent: active.onEvent, signal });
           signal.throwIfAborted();
           let draft = generated;
@@ -405,19 +685,22 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
             text(description, '正文');
             draft = validateDraft({ ...before, description, unknowns: generated.unknowns, createdAt: generated.createdAt });
           }
-          generationController = null;
-          draft.generationId = id;
-          await active.finish();
+          job.controller = null;
+          draft.generationId = generationId;
+          if (!previous) await saveTurn();
+          const warning = [readWarning, writeWarning].filter(Boolean).join(' ') || undefined;
+          await active.finish(undefined, warning);
           const saved = await saveDraft(draft, previous, id, rootId);
-          return { draft: saved, activity: active.view() };
+          return { draft: saved, activity: active.view(), warning };
         } catch (error) {
+          if (!previous && turnFile) await rm(turnFile, { force: true }).catch(() => {});
           const failure = signal.aborted ? Object.assign(new Error('本次生成已停止，已有草稿保留。'), { name: 'AbortError' }) : error;
           await active.finish(failure); throw failure;
         }
       }
       if (route === '/api/submission/check' || route === '/api/submission/link') {
         if (previewSession?.active) throw userError('请先关闭官网浏览器，再核对创建结果');
-        const item = await handle(body.id), c = await config();
+        const item = await mutableDraft(body.id), c = await config();
         if (route === '/api/submission/check') return await checkSubmission(item.draft, c, {
           ...deps, receiptFile: item.receiptFile, keyword: body.keyword, key: body.key, offset: body.offset,
         });
@@ -428,18 +711,26 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
       }
       if (route === '/api/create') {
         if (previewSession?.active) throw userError('请先关闭官网预览，再选择直接创建');
-        const item = await handle(body.id);
+        const item = await mutableDraft(body.id);
         const issue = await submitDraft(item.draft, await config(), { ...deps, receiptFile: item.receiptFile });
         return { issue, draft: await dto(item) };
       }
-      if (route === '/api/preview') return await startPreview(await handle(body.id));
+      if (route === '/api/preview') return await startPreview(await mutableDraft(body.id));
       throw Object.assign(new Error('操作不存在'), { status: 404 });
     } finally {
-      if (route === '/api/draft' || route === '/api/revise') generationController = null;
-      busy = false;
+      if (job) {
+        jobs.delete(job.id);
+        job.resolveDone();
+      }
+      if (ownsLock) busy = false;
+      releaseStart?.();
     }
   };
-  return { dispatch: route, async close() { lifecycle.abort(); previewSession?.controller.abort(); await previewSession?.done; } };
+  return { dispatch: route, async close() {
+    lifecycle.abort();
+    previewSession?.controller.abort();
+    await Promise.all([previewSession?.done, ...[...jobs.values()].map(job => job.done)]);
+  } };
 }
 
 export function trustedRequest(request, host, token, api = true) {

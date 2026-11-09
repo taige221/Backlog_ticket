@@ -25,10 +25,12 @@ let issueFields = null;
 let languages = {};
 let effortLevels = { auto: '默认' };
 let conversationId = crypto.randomUUID();
+let draftListVersion = 0;
+const generationTasks = new Map();
+const draftWarnings = new Map();
+let languageChoice = 0;
 let accountLoading = false;
 let accountVersion = 0;
-let generating = false;
-let stoppingGeneration = false;
 let editing = false;
 let editFiles = [];
 let replaceFileIndex;
@@ -49,6 +51,10 @@ function notify(message, error = false) {
   $('notice').classList.toggle('error', error);
 }
 
+function pendingHistoryText(files) {
+  return files?.length ? ` 待处理的对话文件位于 conversations 目录下（${files.join('、')}）。` : '';
+}
+
 async function api(path, body) {
   if (!token || stopped) throw new Error('请双击启动程序，重新打开工作台。');
   const response = await fetch(`/api/${path}`, {
@@ -59,42 +65,46 @@ async function api(path, body) {
   let result;
   try { result = await response.json(); }
   catch { throw new Error('工作台连接中断，请确认启动程序仍在运行。'); }
-  if (!response.ok) throw new Error(result.error || '操作未完成，请检查配置后重试。');
+  if (!response.ok) throw Object.assign(new Error(result.error || '操作未完成，请检查配置后重试。'), { status: response.status });
   return result;
 }
 
 function locked() { return !!current?.submission; }
 function previewActive() { return preview && !['closed'].includes(preview.state); }
+function activeGeneration() {
+  const task = generationTasks.get(conversationId);
+  return task?.running ? task : null;
+}
 
 function updateControls() {
+  const task = activeGeneration();
   document.querySelectorAll('[data-mutation]').forEach(button => { button.disabled = busy || stopped || !token || editing; });
   document.querySelectorAll('[data-edit-control]').forEach(control => { control.disabled = busy || stopped || !token; });
   $('send').disabled ||= locked();
-  $('send').hidden = generating;
-  $('stop-generation').hidden = !generating;
-  $('stop-generation').disabled = !generating || stoppingGeneration || stopped;
-  $('stop-generation').textContent = stoppingGeneration ? '正在停止…' : '停止生成';
-  $('stop-edit-generation').hidden = !editing || !generating;
-  $('stop-edit-generation').disabled = stoppingGeneration || stopped;
-  $('stop-edit-generation').textContent = $('stop-generation').textContent;
-  if (editing) $('document-status').textContent = generating ? '正在根据截图补充正文…' : '编辑中 · 尚未保存';
-  $('request').disabled = busy || stopped || !token || locked() || editing;
-  $('files').disabled = busy || stopped || !token || !!current;
+  $('send').hidden = !!task;
+  $('stop-generation').hidden = !task;
+  $('stop-generation').disabled = !task || task.stopping || stopped;
+  $('stop-generation').textContent = task?.stopping ? '正在停止…' : '停止生成';
+  $('request').disabled = busy || stopped || !token || locked() || editing || !!task;
+  $('files').disabled = busy || stopped || !token || !!current || !!task;
   $('attach-label').hidden = !!current;
-  $('attach-label').setAttribute('aria-disabled', String(busy || stopped || !token));
-  $('open-preview').disabled ||= locked() || !!previewActive();
-  $('create').disabled ||= locked() || !!previewActive();
-  $('create-confirm').disabled ||= locked();
-  $('edit-draft').disabled ||= !current || locked() || !!previewActive();
+  $('attach-label').setAttribute('aria-disabled', String($('files').disabled));
+  $('open-preview').disabled ||= locked() || !!previewActive() || !!task;
+  $('create').disabled ||= locked() || !!previewActive() || !!task;
+  $('create-confirm').disabled ||= locked() || !!task;
+  $('edit-draft').disabled ||= !current || locked() || !!previewActive() || !!task;
   $('check-submission').disabled ||= !!previewActive();
   $('submission-link').disabled ||= !checkedIssue;
-  $('category-picker').disabled ||= !!current && (locked() || !!previewActive());
+  $('category-picker').disabled ||= !!task || !!current && (locked() || !!previewActive());
   $('category-picker').replaceChildren(document.createTextNode((current ? current.category : config.category) || '分类（可选）'), el('span', '⌄'));
-  for (const id of ['start-date', 'due-date', 'assignee-picker', 'notify-picker']) $(id).disabled ||= !!current && (locked() || !!previewActive());
-  $('language').disabled ||= locked() || !!previewActive();
+  for (const id of ['start-date', 'due-date', 'assignee-picker', 'notify-picker']) $(id).disabled ||= !!task || !!current && (locked() || !!previewActive());
+  $('language').disabled ||= locked() || !!previewActive() || !!task;
   $('preview-continue').disabled ||= preview?.state !== 'waiting';
   $('preview-close').disabled = busy || stopped;
-  document.querySelectorAll('[data-draft-delete]').forEach(button => { button.disabled ||= !!previewActive(); });
+  document.querySelectorAll('[data-draft-delete]').forEach(button => {
+    button.disabled ||= !!previewActive() || !!generationTasks.get(button.dataset.draftDelete || current?.rootId)?.running;
+  });
+  $('upload-list').querySelectorAll('button').forEach(button => { button.disabled ||= !!task; });
   $('shutdown').disabled = busy || stopped || editing;
   $('send').firstChild.textContent = current ? '更新草稿 ' : '整理草稿 ';
   $('composer-mode').textContent = locked() ? '这份草稿已提交或状态待确认，请新建对话' : current ? '修改这份草稿 · 内容会保存为新版本' : '描述一个需要处理的问题';
@@ -140,34 +150,60 @@ function renderRecents() {
   $('draft-count').textContent = String(drafts.length);
   const list = $('draft-list');
   list.replaceChildren();
-  if (!drafts.length) list.append(el('p', '还没有草稿。先描述一个问题吧。', 'no-drafts'));
+  for (const task of generationTasks.values()) {
+    const button = el('button', undefined, `recent-draft${conversationId === task.rootId ? ' active' : ''}`);
+    button.type = 'button'; button.dataset.mutation = '';
+    button.setAttribute('aria-pressed', String(conversationId === task.rootId));
+    button.append(el('strong', task.draft?.summary || task.request.slice(0, 80)), el('small', task.running ? '生成中' : '生成未完成'));
+    button.addEventListener('click', () => openGeneration(task));
+    list.append(button);
+  }
+  if (!drafts.length && !generationTasks.size) list.append(el('p', '还没有草稿。先描述一个问题吧。', 'no-drafts'));
   [...drafts].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).forEach(draft => {
     const row = el('div', undefined, 'recent-draft-row');
-    const button = el('button', undefined, `recent-draft${current?.id === draft.id ? ' active' : ''}`);
+    const selected = current?.id === draft.id && !activeGeneration();
+    const button = el('button', undefined, `recent-draft${selected ? ' active' : ''}`);
     button.type = 'button';
     button.dataset.mutation = '';
-    button.setAttribute('aria-pressed', String(current?.id === draft.id));
+    button.setAttribute('aria-pressed', String(selected));
     button.append(el('strong', draft.summary || '未命名草稿'));
     const date = new Date(draft.createdAt);
-    button.append(el('small', `${draft.target?.project || '草稿'} · ${Number.isNaN(date.valueOf()) ? '' : date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })}${draft.submission ? ' · 已锁定' : ''}`));
-    button.addEventListener('click', () => run(async () => {
-      await discardUploads();
-      current = draft;
-      $('chat-log').replaceChildren();
-      message('assistant', '已打开这份草稿。你可以预览、创建，或直接输入修改要求。');
-      $('request').value = '';
-      renderUploads();
-      renderDraft();
-      renderRecents();
-      updateControls();
-      void refreshUsage();
-      void restoreActivity(draft);
-      workspaceView('document');
-      document.querySelector('.sidebar').classList.remove('recent-open');
-      $('recent-toggle').setAttribute('aria-expanded', 'false');
-    }));
+    button.append(el('small', `${draft.target?.project || '草稿'} · ${Number.isNaN(date.valueOf()) ? '' : date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })}${draft.submission ? ' · 已锁定' : ''}${draftWarnings.has(draft.id) ? ' · 有提示' : ''}`));
+    button.addEventListener('click', () => {
+      const task = generationTasks.get(draft.rootId);
+      if (task?.running) { void openGeneration(task); return; }
+      void run(async () => {
+        await discardUploads();
+        current = draft;
+        conversationId = draft.rootId;
+        issueFields = null;
+        $('chat-log').replaceChildren();
+        const warning = draftWarnings.get(draft.id);
+        draftWarnings.delete(draft.id);
+        try {
+          const { messages, warning: historyWarning } = await api(`history/${draft.id}`);
+          for (const entry of messages) {
+            message('user', entry.request);
+            message('assistant', entry.draftId ? `已保存草稿「${entry.summary}」。` : '这条修改没有对应的草稿版本。');
+          }
+          if (warning || historyWarning) notify([warning, historyWarning].filter(Boolean).join(' '), true);
+        } catch {
+          notify([warning, '对话记录暂时无法读取，仍可继续检查和修改草稿。'].filter(Boolean).join(' '), true);
+        }
+        message('assistant', '已打开这份草稿。你可以预览、创建，或直接输入修改要求。');
+        $('request').value = '';
+        renderUploads();
+        renderDraft();
+        renderRecents();
+        updateControls();
+        void refreshUsage();
+        void restoreActivity(draft);
+        workspaceView('document');
+        closeRecents();
+      });
+    });
     const remove = el('button', '删除', 'recent-draft-delete');
-    remove.type = 'button'; remove.dataset.mutation = ''; remove.dataset.draftDelete = '';
+    remove.type = 'button'; remove.dataset.mutation = ''; remove.dataset.draftDelete = draft.rootId;
     remove.setAttribute('aria-label', `删除草稿：${draft.summary || '未命名草稿'}`);
     remove.addEventListener('click', () => deleteDraft(draft));
     row.append(button, remove); list.append(row);
@@ -191,7 +227,7 @@ function renderDraft() {
   $('draft-actions').hidden = !current || editing;
   $('draft-editor').hidden = !editing;
   $('draft-edit-actions').hidden = !editing;
-  $('document-status').textContent = editing ? '编辑中 · 尚未保存' : current ? locked() ? '提交状态已记录' : '已保存 · 待确认' : '等待整理';
+  $('document-status').textContent = activeGeneration() ? 'AI 正在整理' : editing ? '编辑中 · 尚未保存' : current ? locked() ? '提交状态已记录' : '已保存 · 待确认' : '等待整理';
   $('document-status').classList.toggle('ready', !!current);
   if (!current) { updateControls(); return; }
   $('document-meta').textContent = [current.target?.project, current.issueType, current.category, languages[current.language] || '语言未记录'].filter(Boolean).join(' / ');
@@ -253,16 +289,15 @@ function editFilesChanged() {
 }
 $('draft-editor').addEventListener('submit', event => {
   event.preventDefault();
-  if (!editing || !current || locked()) return;
+  if (!editing || !current || locked() || busy) return;
+  const edit = { summary: $('edit-title').value, description: $('edit-body').value };
+  if (editFilesChanged()) edit.files = editFiles.map(({ id, index, replaces }) => id ? { id, replaces } : { index });
+  if ($('edit-ai').checked) {
+    if (!config.apiKeyConfigured) { notify('请先配置模型 API，或取消勾选 AI 补充后直接保存。', true); return; }
+    void generate('根据本次传入的新截图补充对应段落，只写截图中可确认的内容。保留原标题、章节、已有事实和图片引用位置。没有引用的新截图放到对应段落。', current.language || config.language, edit);
+    return;
+  }
   run(async () => {
-    const edit = { summary: $('edit-title').value, description: $('edit-body').value };
-    if (editFilesChanged()) edit.files = editFiles.map(({ id, index, replaces }) => id ? { id, replaces } : { index });
-    if ($('edit-ai').checked) {
-      if (!config.apiKeyConfigured) throw new Error('请先配置模型 API，或取消勾选 AI 补充后直接保存。');
-      await generate('根据本次传入的新截图补充对应段落，只写截图中可确认的内容。保留原标题、章节、已有事实和图片引用位置。没有引用的新截图放到对应段落。', current.language || config.language, edit);
-      notify('已根据截图补充正文，并保存为新版本。');
-      return;
-    }
     const { draft } = await api('draft/edit', { id: current.id, ...edit });
     current = draft;
     editFiles = [];
@@ -279,8 +314,12 @@ window.addEventListener('beforeunload', event => {
   }
 });
 
-async function refresh() {
-  const state = await api('state');
+async function refresh(resumeActive = false) {
+  let state, version;
+  do {
+    version = draftListVersion;
+    state = await api('state');
+  } while (version !== draftListVersion);
   config = state.config;
   languages = state.languages || languages;
   effortLevels = state.effortLabels || effortLevels;
@@ -288,14 +327,20 @@ async function refresh() {
   drafts = state.drafts || [];
   if (current) current = drafts.find(draft => draft.id === current.id) || current;
   if (state.preview !== undefined) preview = state.preview;
+  if (resumeActive) await resumeGenerations(state.generations || []);
   renderConfig(); renderRecents(); renderDraft(); renderPreview();
   await refreshUsage();
 }
 
-function message(kind, text, pending = false) {
-  $('welcome')?.remove();
+function messageNode(kind, text, pending = false) {
   const item = el('div', undefined, `message ${kind}${pending ? ' pending' : ''}`);
   item.append(el('div', kind === 'user' ? '你' : 'TICKET', 'message-label'), el('div', text, 'message-text'));
+  return item;
+}
+
+function message(kind, text) {
+  $('welcome')?.remove();
+  const item = messageNode(kind, text);
   $('chat-log').append(item);
   $('chat-log').scrollTop = $('chat-log').scrollHeight;
   return item;
@@ -318,6 +363,7 @@ function renderUploads() {
 }
 
 async function discardUploads() {
+  if (activeGeneration()) { uploads = []; return; }
   if (!uploads.length) return;
   await api('uploads/remove', { ids: uploads.map(upload => upload.id) });
   uploads = [];
@@ -334,9 +380,29 @@ function readFile(file) {
 
 const modelImage = file => ['image/png', 'image/jpeg', 'image/webp'].includes(file.type);
 
-async function uploadFile(file) {
+function availableAttachmentName(name, attachments) {
+  const key = value => value.trim().normalize('NFC').toLowerCase();
+  const used = new Set(attachments.map(file => key(file.name)));
+  if (!used.has(key(name))) return name;
+
+  const filename = name.trim();
+  const dot = filename.lastIndexOf('.');
+  const extension = dot > 0 ? filename.slice(dot) : '';
+  const stem = filename.slice(0, filename.length - extension.length);
+  const encoder = new TextEncoder();
+  for (let number = 2; ; number++) {
+    const suffix = `-${number}${extension}`;
+    let candidate = stem + suffix;
+    if (encoder.encode(candidate).length > 255) candidate = `attachment${suffix}`;
+    if (encoder.encode(candidate).length > 255) candidate = `attachment-${number}`;
+    if (!used.has(key(candidate))) return candidate;
+  }
+}
+
+async function uploadFile(file, attachments) {
   if (file.size > 10 * 1024 * 1024) throw new Error(`“${file.name}”超过 10 MB，请压缩后重试。`);
-  const { upload } = await api('upload', { name: file.name, data: await readFile(file), image: modelImage(file) });
+  const name = availableAttachmentName(file.name, attachments);
+  const { upload } = await api('upload', { name, data: await readFile(file), image: modelImage(file) });
   return upload;
 }
 
@@ -379,7 +445,7 @@ function addEditFiles(files, index) {
   return run(async () => {
     if (index !== undefined) {
       const old = editFiles[index];
-      const upload = await uploadFile(files[0]);
+      const upload = await uploadFile(files[0], editFiles.filter((_, position) => position !== index));
       editFiles[index] = { ...upload, replaces: old.index ?? old.replaces };
       renderEditFiles();
       if (old.id) await api('uploads/remove', { ids: [old.id] });
@@ -387,7 +453,7 @@ function addEditFiles(files, index) {
     }
     if (files.length + editFiles.length > Math.max(10, current.attachments.length)) throw new Error('每份草稿最多使用 10 个附件，请先移除多余文件。');
     for (const file of files) {
-      editFiles.push(await uploadFile(file));
+      editFiles.push(await uploadFile(file, editFiles));
       renderEditFiles();
     }
   }, false, true);
@@ -411,12 +477,12 @@ $('edit-body').addEventListener('paste', event => {
 });
 
 async function addFiles(files) {
-  if (current || !files.length) return;
+  if (current || activeGeneration() || !files.length) return;
   await run(async () => {
     for (const file of files) {
       if (uploads.length >= 10) throw new Error('每份草稿最多使用 10 个附件，请先移除多余文件。');
       if (modelImage(file) && uploads.filter(item => item.image).length >= 5) throw new Error('每次最多使用 5 张截图，请先移除多余图片。');
-      uploads.push(await uploadFile(file));
+      uploads.push(await uploadFile(file, uploads));
       renderUploads();
     }
   });
@@ -439,66 +505,197 @@ $('request').addEventListener('keydown', event => { if (event.key === 'Enter' &&
 
 $('composer').addEventListener('submit', event => {
   event.preventDefault();
-  if (locked()) return;
+  if (locked() || editing) return;
   const request = $('request').value.trim();
   if (!request) { $('request').focus(); return; }
   if (!config.apiKeyConfigured) { notify('先配置模型 API，即可开始整理草稿。'); $('settings').showModal(); return; }
-  run(async () => { await generate(request); $('request').value = ''; });
+  void generate(request);
 });
 
-async function generate(request, language = current?.language || config.language, edit) {
-  generating = true; stoppingGeneration = false; updateControls();
-  const revising = !!current;
-  message('user', request + (uploads.length ? `\n\n附件：${uploads.map(file => file.name).join('、')}` : ''));
-  const pending = message('assistant', revising ? '正在更新草稿…' : '正在整理草稿…', true);
-  const details = activityPanel(); pending.append(details.node);
-  let polling = true, timer;
+function restoreGenerationEdit(task) {
+  if (!task.edit || !task.draft) return;
+  editing = true;
+  editFiles = task.editFiles;
+  $('edit-title').value = task.edit.summary;
+  $('edit-body').value = task.edit.description;
+  $('edit-ai').checked = true;
+  renderEditFiles();
+  workspaceView('document');
+}
+
+async function openGeneration(task) {
+  await run(async () => {
+    if (conversationId === task.rootId && task.running) { workspaceView('chat'); closeRecents(); return; }
+    const baseId = task.baseId || task.draft?.id;
+    if (!task.running && task.error && baseId) {
+      const { draft } = await api(`drafts/${baseId}`);
+      if (!draft) {
+        generationTasks.delete(task.rootId);
+        renderRecents();
+        notify('这份草稿已删除。', true);
+        return;
+      }
+      task.draft = draft;
+    }
+    await discardUploads();
+    conversationId = task.rootId;
+    current = task.draft;
+    issueFields = task.issueFields;
+    uploads = task.uploads;
+    $('request').value = task.input;
+    $('chat-log').replaceChildren(...task.messages);
+    workspaceView(task.running || !task.draft ? 'chat' : 'document');
+    if (!task.running) {
+      generationTasks.delete(task.rootId);
+      if (task.error) { restoreGenerationEdit(task); notify(task.error, true); }
+      else if (task.warning) notify(task.warning, true);
+    }
+    renderUploads();
+    renderDraft();
+    renderRecents();
+    updateControls();
+    void refreshUsage();
+    closeRecents();
+  });
+}
+
+function prepareGeneration(task, transcript = []) {
+  const label = task.revising ? '正在更新草稿…' : '正在整理草稿…';
+  const fileNames = task.uploads.map(file => file.name);
+  const report = task.request + (fileNames.length ? `\n\n附件：${fileNames.join('、')}` : '');
+  task.pending = messageNode('assistant', label, true);
+  task.progressText = task.pending.querySelector('.message-text');
+  task.details = activityPanel();
+  task.pending.append(task.details.node);
+  task.messages = [...transcript, messageNode('user', report), task.pending];
+}
+
+function finishGeneration(task, { draft, activity, warning, error }) {
+  task.running = false;
+  clearTimeout(task.timer);
+  task.pending.classList.remove('pending');
+  task.details.render(activity);
+  const selected = conversationId === task.rootId;
+  if (draft) {
+    task.draft = draft;
+    task.uploads = [];
+    task.warning = warning;
+    if (warning && !selected) draftWarnings.set(draft.id, warning);
+    if (task.input.trim() === task.request) task.input = '';
+    drafts = [draft, ...drafts.filter(item => item.id !== draft.id)];
+    draftListVersion++;
+    task.progressText.textContent = (task.revising ? '草稿已更新并保存为新版本。' : '草稿已整理好。') + '检查「当前草稿」后，可以预览、创建，或继续输入修改要求。';
+  } else {
+    task.error = error;
+    task.progressText.textContent = error;
+  }
+  if (!task.error || selected) generationTasks.delete(task.rootId);
+  if (selected) {
+    current = task.draft;
+    uploads = task.uploads;
+    $('request').value = task.revising && !current ? '' : task.input;
+    if (task.error) { restoreGenerationEdit(task); notify(task.error, true); }
+    else {
+      if (task.edit) workspaceView('document');
+      if (warning) notify(warning, true);
+    }
+    renderUploads();
+    renderDraft();
+    void refreshUsage();
+  }
+  renderRecents();
+  updateControls();
+}
+
+function watchGeneration(task, resumed = false) {
   const poll = async () => {
     try {
-      const { activity } = await api('activity');
-      if (polling && activity?.rootId === conversationId && activity.state === 'running') {
-        details.render(activity);
-        pending.querySelector('.message-text').textContent = activity.retrying ? '连接超时，正在重试…' : revising ? '正在更新草稿…' : '正在整理草稿…';
+      const { activity, running } = await api(`activity/${task.id}`);
+      if (!task.running) return;
+      const ownActivity = activity?.rootId === task.rootId ? activity : null;
+      if (ownActivity?.state === 'running') {
+        task.details.render(ownActivity);
+        task.progressText.textContent = ownActivity.retrying ? '连接超时，正在重试…' : task.revising ? '正在更新草稿…' : '正在整理草稿…';
       }
-    }
-    catch { /* A progress lookup must not interrupt generation. */ }
-    finally { if (polling) timer = setTimeout(poll, 900); }
+      if (resumed && !running) {
+        const { draft } = await api(`drafts/${task.resultId}`);
+        if (draft?.generationId === task.id && draft.rootId === task.rootId) {
+          finishGeneration(task, { draft, activity: ownActivity, warning: ownActivity?.warning });
+        } else {
+          finishGeneration(task, { activity: ownActivity, error: ownActivity?.error || '本次生成未保存草稿。' });
+        }
+      }
+    } catch { /* A progress lookup must not interrupt generation. */ }
+    finally { if (task.running && !stopped) task.timer = setTimeout(poll, 900); }
   };
   void poll();
-  try {
-    const { draft, activity } = await api(revising ? 'revise' : 'draft', revising ? { id: current.id, instruction: request, language, edit } : { request, uploadIds: uploads.map(file => file.id), ...pickedFields(), language, conversationId });
-    details.render(activity);
-    current = draft;
-    if (edit) { editFiles = []; editing = false; }
-    uploads = [];
-    renderUploads();
-    await refresh();
-    const review = $('draft-content').hidden ? '展开「当前草稿」后，可以预览、创建，或继续输入修改要求。' : '检查草稿内容后，可以预览、创建，或继续输入修改要求。';
-    pending.querySelector('.message-text').textContent = (revising ? '草稿已更新并保存为新版本。' : '草稿已整理好。') + review;
-  } catch (error) {
-    pending.querySelector('.message-text').textContent = '本次整理未完成，已有草稿保留。';
-    try { const { activity } = await api('activity'); if (activity?.rootId === conversationId) details.render(activity); } catch {}
-    await refreshUsage();
-    throw error;
-  } finally {
-    polling = false; clearTimeout(timer); pending.classList.remove('pending');
-    generating = false; stoppingGeneration = false; updateControls();
+}
+
+async function resumeGenerations(active) {
+  for (const entry of active) {
+    if (generationTasks.has(entry.rootId) || drafts.some(draft => draft.generationId === entry.id)) continue;
+    const draft = entry.baseId ? drafts.find(draft => draft.id === entry.baseId)
+      || (await api(`drafts/${entry.baseId}`).catch(() => ({}))).draft : null;
+    const task = { ...entry, draft, input: entry.edit ? '' : entry.request, revising: !!entry.baseId, running: true };
+    prepareGeneration(task);
+    generationTasks.set(task.rootId, task);
+    watchGeneration(task, true);
   }
 }
 
-async function stopGeneration() {
-  if (!generating || stoppingGeneration || stopped) return;
-  stoppingGeneration = true; updateControls();
+async function generate(request, language = current?.language || config.language, edit) {
+  if (busy || stopped || locked() || activeGeneration()) return;
+  if ([...generationTasks.values()].filter(task => task.running).length >= 2) {
+    notify('最多同时生成 2 份草稿，请等待其中一份完成。', true);
+    renderLanguage();
+    return;
+  }
+  closeMenus();
+  notify('');
+  const id = crypto.randomUUID(), rootId = conversationId, revising = !!current;
+  const input = $('request').value;
+  const task = { id, rootId, request, input, draft: current, uploads, issueFields, edit, editFiles, revising, running: true };
+  const body = revising ? { id: current.id, instruction: request, language, edit, generationId: id }
+    : { request, uploadIds: uploads.map(file => file.id), ...pickedFields(), language, conversationId: rootId, generationId: id };
+  generationTasks.set(rootId, task);
+  if (edit) { editing = false; editFiles = []; workspaceView('chat'); }
+  $('welcome')?.remove();
+  const log = $('chat-log');
+  prepareGeneration(task, [...log.childNodes]);
+  log.append(...task.messages.slice(-2));
+  log.scrollTop = log.scrollHeight;
+  renderRecents();
+  renderDraft();
+  watchGeneration(task);
+  let result;
   try {
-    const { stopping } = await api('generation/stop', {});
-    if (generating) {
+    result = await api(revising ? 'revise' : 'draft', body);
+  } catch (error) {
+    const { activity } = await api(`activity/${id}`).catch(() => ({}));
+    result = { activity: activity?.rootId === rootId ? activity : null, error: error.message };
+    if (!revising && error.status === 409) void refresh().catch(() => {});
+  }
+  finishGeneration(task, result);
+  return !task.error;
+}
+
+async function stopGeneration() {
+  const task = activeGeneration();
+  if (!task || task.stopping || stopped) return;
+  task.stopping = true; updateControls();
+  try {
+    const { stopping } = await api('generation/stop', { id: task.id });
+    if (!stopping) task.stopping = false;
+    if (task === activeGeneration()) {
       notify(stopping ? '正在停止生成，已有草稿会保留。' : '当前没有可停止的生成操作，正在等待结果。');
-      if (!stopping) { stoppingGeneration = false; updateControls(); }
+      updateControls();
     }
-  } catch (error) { stoppingGeneration = false; updateControls(); notify(error.message, true); }
+  } catch (error) {
+    task.stopping = false; updateControls();
+    if (task === activeGeneration()) notify(error.message, true);
+  }
 }
 $('stop-generation').addEventListener('click', stopGeneration);
-$('stop-edit-generation').addEventListener('click', stopGeneration);
 
 function activityPanel() {
   const node = el('details', undefined, 'ai-activity'), summary = el('summary', 'AI 思考与处理详情 · 正在处理'), content = el('div', undefined, 'ai-activity-content');
@@ -527,7 +724,7 @@ async function restoreActivity(draft) {
   if (!draft.generationId) return;
   try {
     const { activity } = await api(`activity/${draft.generationId}`);
-    if (!activity || current?.id !== draft.id) return;
+    if (!activity || current?.id !== draft.id || activeGeneration()) return;
     const details = activityPanel(); details.render(activity);
     message('assistant', '上次生成记录').append(details.node);
   } catch { /* Old drafts remain usable without a generation record. */ }
@@ -551,7 +748,9 @@ async function refreshUsage() {
     $('conversation-usage').textContent = !result.recordedRuns && current ? '旧稿未记录用量，不能据此计算历史费用。' : `${u.requests} 次请求 · ${usageText(u)}\n输入 ${number(u.inputTokens)} / 输出 ${number(u.outputTokens)}\n已知缓存 ${number(u.cachedTokens)} / 已知思考 ${number(u.reasoningTokens)}（服务商统计）`;
     if (result.unreadableRuns) $('conversation-usage').textContent += `\n有 ${result.unreadableRuns} 份本机记录无法读取，合计可能不完整。`;
     $('local-account-usage').textContent = result.localAccount ? `本机记录（当前 Key）：${result.localAccount.requests} 次请求 · ${usageText(result.localAccount)}` : '尚未配置模型 API。';
-  } catch (error) { $('conversation-usage').textContent = error.message; }
+  } catch (error) {
+    if (rootId === (current?.rootId || conversationId)) $('conversation-usage').textContent = error.message;
+  }
 }
 
 async function loadAccount() {
@@ -578,13 +777,16 @@ function renderLanguage() {
   select.title = '模板固定章节名、分类、人员名和代码保留原文';
 }
 
-$('language').addEventListener('change', () => {
+$('language').addEventListener('change', async () => {
   const language = $('language').value;
-  run(async () => {
+  const choice = ++languageChoice, rootId = conversationId;
+  if (current && !await generate(`请将标题、正文说明和待确认项统一改写为${languages[language]}，保留所有事实、模板结构和代码引用，不新增内容。`, language)) return;
+  if (choice !== languageChoice) return;
+  await run(async () => {
     try {
-      if (current) await generate(`请将标题、正文说明和待确认项统一改写为${languages[language]}，保留所有事实、模板结构和代码引用，不新增内容。`, language);
       const saved = await api('config/language', { language }); config = saved.config;
-      renderLanguage(); notify(`起票语言已设为 ${languages[language]}，下次启动会保留。`);
+      renderLanguage();
+      if (rootId === conversationId) notify(`起票语言已设为 ${languages[language]}，下次启动会保留。`);
     } catch (error) { renderLanguage(); throw error; }
   });
 });
@@ -607,6 +809,11 @@ $('recent-toggle').addEventListener('click', () => {
   $('recent-toggle').setAttribute('aria-expanded', String(open));
 });
 
+function closeRecents() {
+  document.querySelector('.sidebar').classList.remove('recent-open');
+  $('recent-toggle').setAttribute('aria-expanded', 'false');
+}
+
 function resetConversation(copy = '开始一个新问题吧。描述实际情况和期望结果，也可以附上截图。') {
   current = null; issueFields = null;
   conversationId = crypto.randomUUID();
@@ -625,13 +832,18 @@ $('brand').addEventListener('click', event => { event.preventDefault(); newConve
 
 async function deleteDraft(draft) {
   await run(async () => {
-    if (!confirm(`删除“${draft.summary || '未命名草稿'}”及其全部历史版本？\n\n会释放不再被其他草稿引用的本机附件，无法恢复。Backlog 上的工单、用量和提交记录会保留。`)) return;
+    if (!confirm(`删除“${draft.summary || '未命名草稿'}”所在的本机对话及其全部草稿版本？\n\n会释放不再被其他草稿引用的本机附件，无法恢复。Backlog 上的工单、用量和提交记录会保留。`)) return;
     let result;
     try { result = await api('draft/delete', { id: draft.id }); }
     catch (error) { await refresh(); throw error; }
-    if (current?.rootId === result.rootId) resetConversation('草稿及其历史版本已删除。可以开始一个新问题。');
+    const deleted = new Set(result.deletedIds);
+    for (const id of deleted) draftWarnings.delete(id);
+    for (const [rootId, task] of generationTasks) {
+      if (!task.running && deleted.has(task.draft?.id)) generationTasks.delete(rootId);
+    }
+    if (deleted.has(current?.id)) resetConversation('草稿及其历史版本已删除。可以开始一个新问题。');
     await refresh();
-    notify(result.warning || `已删除 ${result.deletedIds.length} 个草稿版本，释放附件文件 ${sizeText(result.freedBytes)}。`, !!result.warning);
+    notify(result.warning ? result.warning + pendingHistoryText(result.pendingFiles) : `已删除 ${result.deletedIds.length} 个草稿版本，释放附件文件 ${sizeText(result.freedBytes)}。`, !!result.warning);
   });
 }
 $('delete-draft').addEventListener('click', () => { if (current) void deleteDraft(current); });
@@ -842,15 +1054,24 @@ function renderStorage(storage) {
 }
 
 async function refreshStorage() {
-  const { storage } = await api('storage'); renderStorage(storage);
+  const { storage, pendingHistoryCleanup } = await api('storage');
+  renderStorage(storage);
+  $('cleanup-history').hidden = !pendingHistoryCleanup;
 }
 
 $('refresh-storage').addEventListener('click', () => run(refreshStorage, true));
 $('cleanup-storage').addEventListener('click', () => run(async () => {
-  if (!confirm('清理未被任何已保存草稿引用的附件？当前页面选中的附件会保留，其他页面尚未保存的附件可能被清理。已保存草稿、配置和浏览器登录状态会保留。')) return;
-  const result = await api('storage/cleanup', { keepIds: uploads.map(upload => upload.id) });
+  if (!confirm('清理未被任何已保存草稿引用的附件？当前页面待用和可重试的附件会保留，其他页面尚未保存的附件可能被清理。')) return;
+  const queuedFiles = [...generationTasks.values()].flatMap(task => [...task.uploads, ...task.editFiles]);
+  const keepIds = [...new Set([...uploads, ...editFiles, ...queuedFiles].map(file => file.id).filter(Boolean))];
+  const result = await api('storage/cleanup', { keepIds });
   renderStorage(result.storage);
   $('storage-result').textContent = `已清理 ${result.removedFiles} 个附件，释放 ${sizeText(result.freedBytes)}。`;
+}, true));
+$('cleanup-history').addEventListener('click', () => run(async () => {
+  const { removed, remaining, pendingFiles } = await api('history/cleanup', {});
+  await refreshStorage();
+  $('storage-result').textContent = `已完成 ${removed} 份对话清理。` + (remaining ? `还有 ${remaining} 份待处理，请检查草稿、对话文件或目录权限后重试。` + pendingHistoryText(pendingFiles) : '');
 }, true));
 
 $('settings-open').addEventListener('click', () => {
@@ -1074,7 +1295,7 @@ async function boot() {
   updateControls();
   if (!token) { notify('请双击「启动 Ticket」，使用自动打开的页面进入工作台。', true); return; }
   await run(async () => {
-    await refresh();
+    await refresh(true);
     if (!config.apiKeyConfigured || !config.backlogKeyConfigured) notify('欢迎使用 Ticket。点击「配置工作台」，分别保存模型 API 和 Backlog 配置后即可开始。');
   });
 }

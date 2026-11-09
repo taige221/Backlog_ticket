@@ -174,7 +174,7 @@ export async function generateDraft(config, options, { fetchImpl = fetch, env = 
   const previousContent = previous && withoutLegacyNotes(previous, textFormattingRule);
   const imageReferences = inlineImages.map(file => ({ name: path.basename(file), sentToModel: images.some(image => image.file === file), ...(textFormattingRule && { reference: imageReference(file, textFormattingRule) }) }));
   const request = JSON.stringify({ report: options.request, previousDraft: previousContent ? { summary: categorySummary(previous.summary, previous.category), description: previousContent.description, unknowns: previousContent.unknowns } : undefined, language, issueType, category,
-    project: metadata?.project, template, textFormattingRule, images: imageReferences, users: options.metadata && metadata?.users.length ? metadata.users : undefined, source: source?.snapshot ?? '源码未读取' });
+    conversation: previous ? options.conversation : undefined, project: metadata?.project, template, textFormattingRule, images: imageReferences, users: options.metadata && metadata?.users.length ? metadata.users : undefined, source: source?.snapshot ?? '源码未读取' });
   const instructions = [
     '# 任务',
     '你是起票助手，只拟稿，不创建工单。保持用户原意，没有明确要求不扩展范围。不自行设置负责人、类型或日期。',
@@ -196,7 +196,8 @@ export async function generateDraft(config, options, { fetchImpl = fetch, env = 
     source ? '可多轮调用只读代码工具，不按固定轮数截断调查。每轮可批量请求最多8个相关工具；可并列安排的文件和搜索尽量同轮完成。沿直接调用链核对条件、权限筛选和渲染分支，不漫无目的遍历。已有足够证据就输出完整草稿JSON；仍无法确认的部分写待确认，不无限追查无关信息。读取按nextStart续读，遇到错误先修正参数，避免重复无效请求。' : '本次无代码工具。',
   ].join('\n');
   const languageInstructions = `\n本次起票语言由language字段决定：${ticketLanguages[language]}（${language}）。summary、description的正文说明及unknowns必须统一使用此语言，不能随报告、截图、源码或原草稿的语言变化。模板固定章节标题和标签、分类名称、人名、代码、路径、URL保留原文；除此之外的说明均使用所选语言。`;
-  const revisionInstructions = languageInstructions + (previous ? '\n# 修改已有草稿\nreport是本次修改要求，previousDraft是旧稿。以旧稿章节为骨架，未涉及的事实与结构保留；不根据项目模板后续的变化自动迁移章节。只改标题时保留原正文与具体待确认事项，并移除笼统的生成过程声明；若明确要求清理措辞则只改措辞。语言变化时翻译原稿说明，固定章节名保留原文。目标项目、类型、附件、负责人及日期沿用原稿。不要把修改要求当新问题。' : '');
+  const revisionInstructions = languageInstructions + (previous ? '\n# 修改已有草稿\nreport是本次修改要求，previousDraft是旧稿。以旧稿章节为骨架，未涉及的事实与结构保留；不根据项目模板后续的变化自动迁移章节。只改标题时保留原正文与具体待确认事项，并移除笼统的生成过程声明；若明确要求清理措辞则只改措辞。语言变化时翻译原稿说明，固定章节名保留原文。目标项目、类型、附件、负责人及日期沿用原稿。不要把修改要求当新问题。' : '')
+    + (previous && options.conversation ? '\nconversation是当前草稿分支的原始描述和近期历史要求，按时间从旧到新排列，可能截断。仅用于理解本次要求。以当前草稿为基线，按report执行本次修改，冲突时以最新更正为准。除非本次要求恢复，否则保留已删减的状态，不重复执行旧要求。' : '');
   const input = [{ role: 'user', content: [{ type: 'input_text', text: request }, ...images.map(image => ({ type: 'input_image', image_url: image.url }))] }];
   const messages = [{ role: 'system', content: instructions + revisionInstructions }, { role: 'user', content: [{ type: 'text', text: request }, ...images.map(image => ({ type: 'image_url', image_url: { url: image.url } }))] }];
   const endpoint = model.protocol === 'responses' ? 'responses' : 'chat/completions';
