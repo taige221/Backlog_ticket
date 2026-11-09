@@ -82,6 +82,10 @@ function updateControls() {
   document.querySelectorAll('[data-edit-control]').forEach(control => { control.disabled = busy || stopped || !token; });
   $('send').disabled ||= locked();
   $('send').hidden = !!task;
+  const screenshotReview = task || locked() ? null : current?.screenshotReview;
+  $('review-screenshots').hidden = !screenshotReview || !!screenshotReview.reason;
+  $('screenshot-review-hint').textContent = screenshotReview?.reason || '';
+  $('screenshot-review-hint').hidden = !screenshotReview?.reason;
   $('stop-generation').hidden = !task;
   $('stop-generation').disabled = !task || task.stopping || stopped;
   $('stop-generation').textContent = task?.stopping ? '正在停止…' : '停止生成';
@@ -294,7 +298,7 @@ $('draft-editor').addEventListener('submit', event => {
   if (editFilesChanged()) edit.files = editFiles.map(({ id, index, replaces }) => id ? { id, replaces } : { index });
   if ($('edit-ai').checked) {
     if (!config.apiKeyConfigured) { notify('请先配置模型 API，或取消勾选 AI 补充后直接保存。', true); return; }
-    void generate('根据本次传入的新截图补充对应段落，只写截图中可确认的内容。保留原标题、章节、已有事实和图片引用位置。没有引用的新截图放到对应段落。', current.language || config.language, edit);
+    void generate('根据本次传入的新截图补充对应段落，只写截图中可确认的内容。保留原标题、章节、已有事实和图片引用位置。没有引用的新截图放到对应段落。', { edit });
     return;
   }
   run(async () => {
@@ -509,7 +513,7 @@ $('composer').addEventListener('submit', event => {
   const request = $('request').value.trim();
   if (!request) { $('request').focus(); return; }
   if (!config.apiKeyConfigured) { notify('先配置模型 API，即可开始整理草稿。'); $('settings').showModal(); return; }
-  void generate(request);
+  void generate(request, { reviewScreenshots: event.submitter === $('review-screenshots') });
 });
 
 function restoreGenerationEdit(task) {
@@ -643,7 +647,7 @@ async function resumeGenerations(active) {
   }
 }
 
-async function generate(request, language = current?.language || config.language, edit) {
+async function generate(request, { language = current?.language || config.language, edit, reviewScreenshots } = {}) {
   if (busy || stopped || locked() || activeGeneration()) return;
   if ([...generationTasks.values()].filter(task => task.running).length >= 2) {
     notify('最多同时生成 2 份草稿，请等待其中一份完成。', true);
@@ -655,7 +659,7 @@ async function generate(request, language = current?.language || config.language
   const id = crypto.randomUUID(), rootId = conversationId, revising = !!current;
   const input = $('request').value;
   const task = { id, rootId, request, input, draft: current, uploads, issueFields, edit, editFiles, revising, running: true };
-  const body = revising ? { id: current.id, instruction: request, language, edit, generationId: id }
+  const body = revising ? { id: current.id, instruction: request, language, edit, reviewScreenshots, generationId: id }
     : { request, uploadIds: uploads.map(file => file.id), ...pickedFields(), language, conversationId: rootId, generationId: id };
   generationTasks.set(rootId, task);
   if (edit) { editing = false; editFiles = []; workspaceView('chat'); }
@@ -780,7 +784,7 @@ function renderLanguage() {
 $('language').addEventListener('change', async () => {
   const language = $('language').value;
   const choice = ++languageChoice, rootId = conversationId;
-  if (current && !await generate(`请将标题、正文说明和待确认项统一改写为${languages[language]}，保留所有事实、模板结构和代码引用，不新增内容。`, language)) return;
+  if (current && !await generate(`请将标题、正文说明和待确认项统一改写为${languages[language]}，保留所有事实、模板结构和代码引用，不新增内容。`, { language })) return;
   if (choice !== languageChoice) return;
   await run(async () => {
     try {

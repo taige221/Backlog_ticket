@@ -43,7 +43,8 @@
             <div id="composer-mode" class="composer-mode">描述一个需要处理的问题</div>
             <label class="sr-only" for="request">问题描述或修改要求</label><textarea id="request" placeholder="例如：手机上查看书类配付详情时，按钮被挤到了画面外…" rows="3"></textarea>
             <div id="upload-list" class="upload-list"></div>
-            <div class="composer-footer"><label class="attach-button" id="attach-label" title="添加截图或附件"><span aria-hidden="true">＋</span> 截图 / 附件<input id="files" type="file" multiple hidden></label><span id="composer-hint">可拖入文件，或粘贴截图</span><button id="stop-generation" class="secondary-button stop-generation" type="button" hidden>停止生成</button><button id="send" class="send-button" type="submit" data-mutation>整理草稿 <span aria-hidden="true">↑</span></button></div>
+            <p id="screenshot-review-hint" class="composer-mode" hidden></p>
+            <div class="composer-footer"><label class="attach-button" id="attach-label" title="添加截图或附件"><span aria-hidden="true">＋</span> 截图 / 附件<input id="files" type="file" multiple hidden></label><span id="composer-hint">可拖入文件，或粘贴截图</span><button id="stop-generation" class="secondary-button stop-generation" type="button" hidden>停止生成</button><button id="send" class="send-button" type="submit" data-mutation>整理草稿 <span aria-hidden="true">↑</span></button><button id="review-screenshots" class="secondary-button" type="submit" title="将已有截图再次发送给所选模型" data-mutation hidden>复核截图并更新</button></div>
           </form>
           <p class="privacy-note">内容会发送至所选模型。附件保存在本机，可在配置工作台查看占用与清理。</p>
         </section>

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, cp, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile, readdir, symlink } from 'node:fs/promises';
+import { chmod, cp, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile, readdir, symlink, truncate } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createWebApp, trustedRequest } from '../src/web-server.js';
@@ -671,6 +671,74 @@ test('网页图片与其他附件在拟稿、修改及创建之间保持一致�
   const model = app.seen.find(item => item.route.endsWith('/responses'));
   assert.equal(JSON.parse(model.body).input[0].content.filter(item => item.type === 'input_image').length, 1);
   assert(!model.body.includes('%PDF-1.4'));
+});
+
+test('复核已有截图时重传可读图片，保留附件顺序及源码工具', async t => {
+  const app = await fixture(t);
+  const upload = async (name, data, image = false) => (await app.post('upload', { name, data: data.toString('base64'), image })).upload.id;
+  const png = Buffer.from([137,80,78,71,13,10,26,10]);
+  const uploadIds = [await upload('说明.pdf', Buffer.from('%PDF-1.4')), await upload('展开.png', png, true),
+    await upload('动画.gif', Buffer.from('GIF89a')), await upload('收起.png', png, true)];
+  const first = (await app.post('draft', { request: '菜单异常', uploadIds })).draft;
+  const { draft } = await app.post('draft/edit', { id: first.id, summary: first.summary, description: first.description,
+    files: [2, 0, 3, 1].map(index => ({ index })) });
+  assert.deepEqual(draft.screenshotReview, { reason: null });
+  const lastCall = () => JSON.parse(app.seen.filter(call => call.route.endsWith('/responses')).at(-1).body);
+
+  await app.post('revise', { id: draft.id, instruction: '缩短标题' });
+  assert.equal(lastCall().input[0].content.length, 1);
+
+  await app.post('config/repo', { repo: app.root });
+  const revised = (await app.post('revise', { id: draft.id, instruction: '根据代码重新核对现象', reviewScreenshots: true })).draft;
+  assert.deepEqual(revised.attachments, draft.attachments);
+  const payload = lastCall();
+  assert(payload.tools.some(tool => tool.name === 'read_file'));
+  assert.match(payload.instructions, /修正与截图明确冲突的状态或描述/);
+  assert.match(payload.instructions, /直接证据足以解释现象时，立即输出/);
+  const [report, ...images] = payload.input[0].content;
+  assert.deepEqual(JSON.parse(report.text).images.map(({ name, sentToModel }) => [name, sentToModel]), [
+    ['展开.png', true], ['动画.gif', false], ['收起.png', true],
+  ]);
+  assert.deepEqual(images.map(image => image.image_url), Array(2).fill(`data:image/png;base64,${png.toString('base64')}`));
+});
+
+test('截图复核的数量和总大小在进入生成及记录对话前校验', async t => {
+  const app = await fixture(t);
+  const png = Buffer.from([137,80,78,71,13,10,26,10]);
+  const upload = async (name, data, image = false) => (await app.post('upload', { name, data: data.toString('base64'), image })).upload;
+  const pdf = await upload('说明.pdf', Buffer.from('%PDF-1.4'));
+  const first = (await app.post('draft', { request: '菜单异常', uploadIds: [pdf.id] })).draft;
+  const images = [];
+  for (let i = 0; i < 6; i++) images.push(await upload(`截图${i}.png`, png, true));
+  const edit = async files => (await app.post('draft/edit', { id: first.id, summary: first.summary, description: first.description,
+    files: [{ index: 0 }, ...files.map(({ id }) => ({ id }))] })).draft;
+  const tooMany = await edit(images);
+  const review = id => app.post('revise', { id, instruction: '根据源码核对截图', reviewScreenshots: true });
+  const modelCalls = app.seen.filter(call => call.route.endsWith('/responses')).length;
+  const history = await app.get(`history/${first.id}`);
+  const manyHistory = await app.get(`history/${tooMany.id}`);
+  assert.equal(first.screenshotReview, undefined);
+  assert.match(tooMany.screenshotReview.reason, /最多 5 张/);
+  await assert.rejects(review(first.id), /没有可供模型复核/);
+  await assert.rejects(review(tooMany.id), /最多 5 张/);
+  assert.deepEqual(await app.get(`history/${tooMany.id}`), manyHistory);
+
+  const two = await edit(images.slice(0, 2));
+  const twoHistory = await app.get(`history/${two.id}`);
+  const imagePath = ({ id, name }) => path.join(app.root, 'uploads', id, name);
+  const half = 5 * 1024 * 1024;
+  await Promise.all(images.slice(0, 2).map(image => truncate(imagePath(image), half)));
+  const saved = async () => (await app.get(`drafts/${two.id}`)).draft;
+  assert.deepEqual((await saved()).screenshotReview, { reason: null });
+  await truncate(imagePath(images[1]), half + 1);
+  assert.match((await saved()).screenshotReview.reason, /合计最多 10 MiB/);
+  await assert.rejects(review(two.id), /合计最多 10 MiB/);
+  assert.equal(app.seen.filter(call => call.route.endsWith('/responses')).length, modelCalls);
+  assert.deepEqual(await app.get(`history/${first.id}`), history);
+  assert.deepEqual(await app.get(`history/${two.id}`), twoHistory);
+
+  const ordinary = (await app.post('revise', { id: two.id, instruction: '只改标题' })).draft;
+  assert.deepEqual(ordinary.attachments, two.attachments);
 });
 
 test('手动将图片移到对应正文段落后，预览与创建保留位置、图片说明及其他附件', async t => {

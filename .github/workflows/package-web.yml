@@ -1,0 +1,118 @@
+name: 打包 Ticket
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 构建平台（macos-15 为 Apple 芯片，macos-15-intel 为 Intel）
+        type: choice
+        required: true
+        default: macos-15
+        options:
+          - macos-15
+          - macos-15-intel
+          - windows-2025
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ${{ inputs.platform }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 下载可随包分发的 ripgrep
+        run: |
+          $version = '15.2.0'
+          if ($env:RUNNER_OS -eq 'Windows') {
+            $target = 'x86_64-pc-windows-msvc'
+            $extension = 'zip'
+            $binary = 'rg.exe'
+            $sha256 = '71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5'
+          } elseif ($env:RUNNER_ARCH -eq 'ARM64') {
+            $target = 'aarch64-apple-darwin'
+            $extension = 'tar.gz'
+            $binary = 'rg'
+            $sha256 = '3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4'
+          } else {
+            $target = 'x86_64-apple-darwin'
+            $extension = 'tar.gz'
+            $binary = 'rg'
+            $sha256 = 'af7825fcc69a2afc7a7aea55fc9af90e26421d8f20fe59df32e233c0b8a231c1'
+          }
+          $directory = Join-Path $env:RUNNER_TEMP 'ticket-ripgrep'
+          New-Item -ItemType Directory -Path $directory | Out-Null
+          $asset = "ripgrep-$version-$target"
+          $archive = Join-Path $directory "$asset.$extension"
+          Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/$version/$asset.$extension" -OutFile $archive
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $sha256) {
+            throw 'ripgrep 下载文件校验失败'
+          }
+          if ($extension -eq 'zip') {
+            Expand-Archive -LiteralPath $archive -DestinationPath $directory
+          } else {
+            tar -xzf $archive -C $directory
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $binDirectory = Join-Path $directory $asset
+          "TICKET_RIPGREP=$(Join-Path $binDirectory $binary)" >> $env:GITHUB_ENV
+          $binDirectory >> $env:GITHUB_PATH
+
+      - name: 运行测试
+        if: runner.os == 'macOS'
+        run: npm test
+
+      - name: 生成 ZIP
+        id: package
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $env:RUNNER_TEMP 'ticket-browsers'
+          npx playwright install chromium --no-shell
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $platform = node -p "process.platform + '-' + process.arch"
+          $nativePlatform = if ($env:RUNNER_OS -eq 'Windows') { 'win32' } else { 'darwin' }
+          $nativeArch = $env:RUNNER_ARCH.ToLowerInvariant()
+          if ($platform -ne "$nativePlatform-$nativeArch") { throw "Node 架构与构建平台不一致：$platform" }
+          $package = "dist/Ticket-web-$platform-$($env:GITHUB_SHA.Substring(0, 8))"
+          npm run package:web -- --rg $env:TICKET_RIPGREP --out $package
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "zip=$package.zip" >> $env:GITHUB_OUTPUT
+
+      - name: 解压并验证启动
+        env:
+          TICKET_ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          $zip = Get-Item -LiteralPath $env:TICKET_ZIP
+          $directory = Join-Path $env:RUNNER_TEMP 'ticket-smoke'
+          New-Item -ItemType Directory -Path $directory | Out-Null
+          if ($env:RUNNER_OS -eq 'Windows') {
+            Expand-Archive -LiteralPath $zip.FullName -DestinationPath $directory
+            $binary = 'node.exe'
+          } else {
+            /usr/bin/ditto -x -k $zip.FullName $directory
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $binary = 'node'
+          }
+          $bundle = Join-Path $directory $zip.BaseName
+          $node = Join-Path (Join-Path $bundle 'runtime') $binary
+          & $node scripts/smoke-package.js $bundle
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.package.outputs.zip }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 7

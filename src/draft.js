@@ -5,7 +5,7 @@ import { reasoningParameters } from './models.js';
 import { openSource, sourceReadLimit } from './source.js';
 import { getProjectMetadata, selectedProjectType, listCategories, resolveCategory, selectedProjectCategory, categorySummary, validCategoryName } from './backlog.js';
 import { selectIssueType, assertTemplateStructure, cleanSummary, codeLayout } from './templates.js';
-import { imageMime, attachmentImages, inlineImageDescription, imageReference } from './attachments.js';
+import { imageMime, attachmentImages, inlineImageDescription, imageReference, maxScreenshotCount, maxScreenshotBytes, screenshotReviewSizeError } from './attachments.js';
 
 const tool = (name, description, properties, required) => ({
   type: 'function', name, description, strict: false,
@@ -124,11 +124,11 @@ export function assertDraftWording(description, format, { preserveNarration = fa
 export async function imageData(filename) {
   const file = await realpath(filename);
   const size = (await stat(file)).size;
-  if (size > 10 * 1024 * 1024 || size === 0) throw new Error('截图必须非空且不超过10 MiB');
+  if (size > maxScreenshotBytes || size === 0) throw new Error('截图必须非空且不超过10 MiB');
   const bytes = await readFile(file);
   const mime = imageMime(bytes);
   if (!mime || mime === 'image/gif') throw new Error('截图仅支持 PNG、JPEG、WebP（按内容校验）');
-  return { file, url: `data:${mime};base64,${bytes.toString('base64')}` };
+  return { file, size: bytes.length, url: `data:${mime};base64,${bytes.toString('base64')}` };
 }
 
 export async function generateDraft(config, options, { fetchImpl = fetch, env = process.env, log = () => {}, onEvent = async () => {}, signal } = {}) {
@@ -141,10 +141,12 @@ export async function generateDraft(config, options, { fetchImpl = fetch, env = 
   const previous = options.previousDraft;
   if (previous) validateDraft(previous);
   validateDraft({ version: 1, summary: 'validation', description: 'validation', unknowns: [], attachments: [], issueType: options.issueType, assignee: options.assignee, startDate: options.startDate, dueDate: options.dueDate, notifiedUsers: options.notifiedUsers });
-  if ((options.images?.length ?? 0) > 5) throw new Error('第一版最多支持5张截图');
+  const reviewScreenshots = previous && options.reviewScreenshots === true;
+  if ((options.images?.length ?? 0) > maxScreenshotCount) throw new Error(`最多支持${maxScreenshotCount}张截图`);
   const images = await Promise.all((options.images ?? []).map(imageData));
+  if (reviewScreenshots && images.reduce((sum, image) => sum + image.size, 0) > maxScreenshotBytes) throw new Error(screenshotReviewSizeError);
   const attachments = await Promise.all((options.attachments ?? []).map(file => realpath(file)));
-  const allAttachments = [...new Set([...images.map(image => image.file), ...attachments])];
+  const allAttachments = [...new Set(reviewScreenshots ? attachments : [...images.map(image => image.file), ...attachments])];
   const inlineImages = await attachmentImages(allAttachments);
   const project = previous?.target?.project || options.project || config.backlog?.project;
   const target = previous?.target || (project ? { origin: httpUrl(config.backlog?.origin, 'Backlog 地址', { originOnly: true }), project: projectKey(project) } : undefined);
@@ -193,10 +195,11 @@ export async function generateDraft(config, options, { fetchImpl = fetch, env = 
     'images列出图片附件的原文件名、是否在本轮传入图片（sentToModel）及项目正文引用（reference）。实际传入图片按sentToModel=true的顺序对应。新建时根据图片内容，将reference原样插在对应的现象、复现步骤、预期效果等段落后，不统一堆到正文末尾；多图分别对应内容，同一图片只引用一次。没有reference时不猜正文引用语法。未传入的图片不凭文件名猜画面内容，修改时保留旧稿图片引用及其位置；用户要求移动图片时按要求调整。其他文件只作为附件，不写成图片。',
     '# 输出',
     '输出且只输出JSON：{"summary":"标题","description":"完整票面正文","unknowns":["待确认项"]}。未验证事项写在正文相应位置；没有关键待确认项时unknowns为空数组。',
-    source ? '可多轮调用只读代码工具，不按固定轮数截断调查。每轮可批量请求最多8个相关工具；可并列安排的文件和搜索尽量同轮完成。沿直接调用链核对条件、权限筛选和渲染分支，不漫无目的遍历。已有足够证据就输出完整草稿JSON；仍无法确认的部分写待确认，不无限追查无关信息。读取按nextStart续读，遇到错误先修正参数，避免重复无效请求。' : '本次无代码工具。',
+    source ? '可多轮调用只读代码工具。每轮可批量请求最多8个相关工具，可独立完成的搜索和读取放在同一轮，只读命中行附近的必要片段。沿直接调用链核对数据或权限来源、判定条件和实际执行或渲染分支。直接证据足以解释现象时，立即输出完整草稿JSON。只有缺少会改变技术判断的证据才继续查；缺失的账号、环境和运行状态写待确认。读取按nextStart续读，遇到错误先修正参数。' : '本次无代码工具。',
   ].join('\n');
   const languageInstructions = `\n本次起票语言由language字段决定：${ticketLanguages[language]}（${language}）。summary、description的正文说明及unknowns必须统一使用此语言，不能随报告、截图、源码或原草稿的语言变化。模板固定章节标题和标签、分类名称、人名、代码、路径、URL保留原文；除此之外的说明均使用所选语言。`;
   const revisionInstructions = languageInstructions + (previous ? '\n# 修改已有草稿\nreport是本次修改要求，previousDraft是旧稿。以旧稿章节为骨架，未涉及的事实与结构保留；不根据项目模板后续的变化自动迁移章节。只改标题时保留原正文与具体待确认事项，并移除笼统的生成过程声明；若明确要求清理措辞则只改措辞。语言变化时翻译原稿说明，固定章节名保留原文。目标项目、类型、附件、负责人及日期沿用原稿。不要把修改要求当新问题。' : '')
+    + (reviewScreenshots ? '\n本次同时复核已有截图。调查源码前，先逐张按画面可见证据确认状态和对应现象。旧稿的描述是待核对的内容，修正与截图明确冲突的状态或描述，把图片引用放在修正后的对应段落。保留用户明确提供的条件；图片无法区分的状态写待确认。' : '')
     + (previous && options.conversation ? '\nconversation是当前草稿分支的原始描述和近期历史要求，按时间从旧到新排列，可能截断。仅用于理解本次要求。以当前草稿为基线，按report执行本次修改，冲突时以最新更正为准。除非本次要求恢复，否则保留已删减的状态，不重复执行旧要求。' : '');
   const input = [{ role: 'user', content: [{ type: 'input_text', text: request }, ...images.map(image => ({ type: 'input_image', image_url: image.url }))] }];
   const messages = [{ role: 'system', content: instructions + revisionInstructions }, { role: 'user', content: [{ type: 'text', text: request }, ...images.map(image => ({ type: 'image_url', image_url: { url: image.url } }))] }];

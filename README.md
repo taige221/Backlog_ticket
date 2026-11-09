@@ -40,3 +40,9 @@ npm run web
 ```
 
 CLI 可运行 `npm run ticket -- init` 配置、`npm run ticket -- chat` 起票，或用 `npm run ticket -- --help` 查看命令。可在对应架构的 macOS 或 Windows 上运行 `npm run package:web` 生成发行包。
+
+## 在 GitHub 打包
+
+工作流合入默认分支后，打开仓库的「Actions → 打包 Ticket → Run workflow」，选分支和平台。Apple 芯片选 `macos-15`，Intel Mac 选 `macos-15-intel`，Windows x64 选 `windows-2025`。
+
+构建完成后，在该次运行的「Artifacts」下载 ZIP，文件名包含平台和提交编号，保留 7 天。打包时使用仓库中的源码，无需填写模型或 Backlog 密钥。

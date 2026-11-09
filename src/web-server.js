@@ -16,7 +16,7 @@ import { checkSubmission, linkSubmission } from './reconcile.js';
 import { startGeneration, savedGeneration, recordedUsage } from './generation.js';
 import { accountUsage } from './usage.js';
 import { uploadId, uploadStorage, cleanUploads } from './uploads.js';
-import { attachmentImages, inlineImageDescription, rewriteImageReferences } from './attachments.js';
+import { attachmentImages, inlineImageDescription, inspectScreenshotReview, rewriteImageReferences } from './attachments.js';
 
 const exec = promisify(execFile);
 const assetRoot = fileURLToPath(new URL('../web/', import.meta.url));
@@ -250,7 +250,7 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
     }
     return { messages, warning };
   };
-  const dto = async item => {
+  const dto = async (item, { includeScreenshotReview = true } = {}) => {
     let submission = null, submittedSummary;
     try {
       const saved = JSON.parse(await readFile(item.receiptFile, 'utf8'));
@@ -261,8 +261,17 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
     const { summary: rawSummary, description, unknowns, target, issueType, category, language, assignee, startDate, dueDate, notifiedUsers = [], createdAt, revisionOf } = withDefaultSchedule(item.draft);
     const normalizedSummary = categorySummary(rawSummary, category);
     const summary = !submission || submittedSummary === normalizedSummary ? normalizedSummary : rawSummary;
+    let screenshotReview;
+    if (includeScreenshotReview && !submission && item.draft.attachments.length) {
+      try {
+        const { files, reason } = await inspectScreenshotReview(item.draft.attachments);
+        if (files.length) screenshotReview = { reason: reason ?? null };
+      } catch {
+        screenshotReview = { reason: '无法检查已有附件，请确认文件仍可读取且图片名称唯一。' };
+      }
+    }
     return { id: item.id, rootId: item.rootId, summary, description, unknowns, target, issueType, category, language, assignee, startDate, dueDate, notifiedUsers, createdAt, generationId: validId(item.draft.generationId) ? item.draft.generationId : undefined, revisionOf: revisionParentId(revisionOf),
-      attachments: item.draft.attachments.map(file => ({ name: path.basename(file) })), submission };
+      attachments: item.draft.attachments.map(file => ({ name: path.basename(file) })), submission, ...(screenshotReview && { screenshotReview }) };
   };
   const recent = async () => {
     const files = await draftEntries();
@@ -280,7 +289,7 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
     return dto(await handle(id));
   };
   const ensureUnsubmitted = async item => {
-    if ((await dto(item)).submission) throw userError('这份草稿已提交或结果未确认，请先核对工单，避免重复创建');
+    if ((await dto(item, { includeScreenshotReview: false })).submission) throw userError('这份草稿已提交或结果未确认，请先核对工单，避免重复创建');
   };
   const readUploads = async ids => {
     if (!Array.isArray(ids) || ids.length > 10 || ids.some(id => !uploadId(id))) throw userError('附件列表无效，最多 10 个新文件');
@@ -630,6 +639,13 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
           attachments = before.attachments;
         }
         const request = text(previous ? body.instruction : body.request, previous ? '修改要求' : '问题描述');
+        const reviewScreenshots = !!previous && !attachmentEdit && body.reviewScreenshots === true;
+        if (reviewScreenshots) {
+          const { files, reason } = await inspectScreenshotReview(attachments);
+          if (reason) throw userError(reason);
+          if (!files.length) throw userError('草稿中没有可供模型复核的 PNG、JPEG 或 WebP 截图');
+          images = files;
+        }
         if (body.conversationId != null && !validId(body.conversationId)) throw userError('对话编号无效');
         const id = newId(), rootId = previous?.rootId || body.conversationId || id;
         const generationId = body.generationId ?? id;
@@ -677,6 +693,7 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
           signal.throwIfAborted();
           if (previous) await saveTurn();
           const generated = await generateDraft(c, { request, previousDraft: before, conversation, language: body.language, repo: attachmentEdit ? '' : undefined,
+            reviewScreenshots,
             images, attachments, issueType: before?.issueType, assignee: before ? before.assignee : body.assignee || undefined, startDate: before ? before.startDate : body.startDate, dueDate: before ? before.dueDate : body.dueDate, notifiedUsers: before ? before.notifiedUsers : body.notifiedUsers }, { fetchImpl: fetchSafe, env, log: active.log, onEvent: active.onEvent, signal });
           signal.throwIfAborted();
           let draft = generated;

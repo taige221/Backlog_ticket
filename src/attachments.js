@@ -1,6 +1,10 @@
-import { open } from 'node:fs/promises';
+import { open, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { bodyHeadings, codeLayout } from './templates.js';
+
+export const maxScreenshotCount = 5;
+export const maxScreenshotBytes = 10 * 1024 * 1024;
+export const screenshotReviewSizeError = '截图复核合计最多 10 MiB，请减少截图或替换为较小的图片。';
 
 export function imageMime(bytes) {
   if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
@@ -9,13 +13,14 @@ export function imageMime(bytes) {
   if (/^GIF8[79]a$/.test(bytes.toString('ascii', 0, 6))) return 'image/gif';
 }
 
-export async function attachmentImages(attachments) {
+export async function attachmentImages(attachments, { includeGif = true } = {}) {
   const images = [];
   for (const file of attachments) {
     const handle = await open(file, 'r');
     try {
       const { buffer, bytesRead } = await handle.read(Buffer.alloc(12), 0, 12, 0);
-      if (imageMime(buffer.subarray(0, bytesRead))) images.push(file);
+      const mime = imageMime(buffer.subarray(0, bytesRead));
+      if (mime && (includeGif || mime !== 'image/gif')) images.push(file);
     } finally { await handle.close(); }
   }
   for (const file of images) {
@@ -23,6 +28,19 @@ export async function attachmentImages(attachments) {
     if (attachments.filter(item => path.basename(item) === name).length > 1) throw new Error(`图片附件同名，无法准确引用：${name}。请重命名后重试`);
   }
   return images;
+}
+
+export async function inspectScreenshotReview(attachments) {
+  const paths = [...new Set(await Promise.all(attachments.map(file => realpath(file))))];
+  const sizes = new Map(await Promise.all(paths.map(async file => {
+    const info = await stat(file);
+    if (!info.isFile()) throw new Error('附件不是普通文件');
+    return [file, info.size];
+  })));
+  const files = await attachmentImages(paths, { includeGif: false });
+  if (files.length > maxScreenshotCount) return { files, reason: `截图复核最多 ${maxScreenshotCount} 张，请减少草稿中的截图。` };
+  if (files.reduce((sum, file) => sum + sizes.get(file), 0) > maxScreenshotBytes) return { files, reason: screenshotReviewSizeError };
+  return { files };
 }
 
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
