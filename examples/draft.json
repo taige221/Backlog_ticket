@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "summary": "【预览验证・请勿提交】独立 CLI 草稿",
+  "description": "## 现状\n这是供 CLI show 和官网预览验证使用的示例草稿。\n\n## 期望\n**官网渲染**、列表、勾选框和代码块能够显示。\n\n- 草稿尚未创建\n- [ ] 请勿提交示例\n\n```text\npreview_only = true\n```\n\n## 验证边界\n本示例没有调查业务代码。",
+  "unknowns": ["示例不代表真实业务需求"],
+  "attachments": [],
+  "source": null
+}

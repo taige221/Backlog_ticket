@@ -1,0 +1,22 @@
+{
+  "name": "backlog-ticket-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "ticket": "./bin/ticket.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "ticket": "node ./bin/ticket.js",
+    "web": "node ./bin/web.js",
+    "package:web": "node ./scripts/package-web.js",
+    "eval:prompts": "node ./scripts/evaluate-prompts.js"
+  },
+  "dependencies": {
+    "playwright": "1.64.1"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+.ticket/
+*.local.json
+.env*
+credentials.json
+credentials.json.*.tmp
+dist/
+.cache/
+artifacts
+.DS_Store

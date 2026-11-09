@@ -1,0 +1,145 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { selectIssueType, assertTemplateStructure, cleanSummary } from '../src/templates.js';
+import { generateDraft } from '../src/draft.js';
+import { credentials, exampleConfig } from '../src/config.js';
+
+const origin = 'https://fixture.backlog.com';
+const config = { ...exampleConfig, model: { ...exampleConfig.model, provider: 'openai', name: 'fixture-model' },
+  backlog: { origin, project: 'DEMO' }, [credentials]: {
+    openai: { baseUrl: exampleConfig.model.baseUrl, key: 'model-test-secret' },
+    backlog: { origin, key: 'backlog-test-secret' },
+  } };
+const task = { id: 999, name: 'タスク', templateSummary: '[改善] <対象と内容>', templateDescription: '## 現状\n記入例\n\n## 対応内容\n記入例\n\n## 確認事項\n- [ ] 実機確認' };
+const completed = { summary: '[改善] モーダルを閉じた後のスクロールを復帰する',
+  description: '## 現状\n閉じた後にスクロールできない。\n\n## 対応内容\n原因は待確認。\n\n## 確認事項\n- [ ] 実機確認', unknowns: ['原因待確認'] };
+const json = value => ({ ok: true, json: async () => value });
+const response = (draft, protocol = 'responses') => protocol === 'responses'
+  ? json({ output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify(draft) }] }] })
+  : json({ choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: JSON.stringify(draft) } }] });
+
+test('标题去除前后端模板占位与已重复的模块空值尾巴，保留问题中的斜线', () => {
+  assert.equal(cleanSummary('【Frontend】问题/Frontend名/Backend名'), '【Frontend】问题');
+  for (const none of ['无', 'なし', 'None', 'N/A']) {
+    const title = `【frontend】通用设置菜单折叠与展开时权限显示不一致 / 通用设置菜单 / ${none}`;
+    assert.equal(cleanSummary(title), '【frontend】通用设置菜单折叠与展开时权限显示不一致');
+  }
+  for (const title of ['【UI/Frontend】HTTP/HTTPS 跳转失败', '无法访问 https://example.test/foo/bar', '读取 /src/settings/menu.ts 失败', '菜单折叠/展开显示不一致', '显示值/后台值/无', 'foo 页面无法访问 https://example.test/foo/none', 'foo 读取 /tmp/foo/none 失败', 'foo 无法读取 /tmp/foo/none']) assert.equal(cleanSummary(title), title);
+});
+
+test('两种协议不再传标题的前后端占位，旧稿修改与模型输出都去掉重复元数据尾巴', async () => {
+  const summary = '【frontend】通用设置菜单权限显示不一致/通用设置菜单/无';
+  for (const protocol of ['responses', 'chat-completions']) {
+    const selected = { ...config, model: { ...config.model, protocol } };
+    const previous = { version: 1, summary, description: completed.description, unknowns: [], attachments: [] };
+    const draft = await generateDraft(selected, { request: '整理标题', previousDraft: previous }, { env: {}, fetchImpl: async (url, options) => {
+      if (options.method === 'GET') return url.pathname.endsWith('issueTypes')
+        ? json([{ ...task, templateSummary: '【Frontend】問題の説明/Frontend名/Backend名' }])
+        : json({ projectKey: 'DEMO', textFormattingRule: 'markdown' });
+      const body = JSON.parse(options.body), request = JSON.parse(protocol === 'responses' ? body.input[0].content[0].text : body.messages[1].content[0].text);
+      assert.equal(request.template, undefined);
+      assert.equal(request.previousDraft.summary, '【frontend】通用设置菜单权限显示不一致');
+      assert((body.instructions || body.messages[0].content).includes('不要在标题末尾附加 /Frontend名/Backend名'));
+      return response({ ...completed, summary }, protocol);
+    } });
+    assert.equal(draft.summary, '【frontend】通用设置菜单权限显示不一致');
+    assert.equal(previous.summary, summary);
+  }
+});
+
+test('Task 别名只匹配实际可用类型，明确指定的类型优先，不硬编码 ID', () => {
+  const bug = { name: 'Bug' };
+  assert.equal(selectIssueType([bug, task]), task);
+  for (const name of ['Task', 'task', 'TASK', 'タスク', '任务']) assert.equal(selectIssueType([task], name), task);
+  assert.equal(selectIssueType([task, bug], 'Bug'), bug);
+  assert.throws(() => selectIssueType([bug]), /没有 Task/);
+  assert.throws(() => selectIssueType([task], 'Custom'), /指定类型/);
+  const english = { name: 'Task' };
+  assert.throws(() => selectIssueType([task, english]), /多个 Task/);
+  assert.equal(selectIssueType([task, english], 'Task'), english);
+});
+
+test('Markdown 模板章节必须按原顺序保留，代码块里的假章节不能通过检查', () => {
+  assertTemplateStructure(completed.description, task.templateDescription, 'markdown');
+  for (const description of ['## 現状\n问题', '## 確認事項\n## 対応内容\n## 現状', '```md\n## 現状\n## 対応内容\n## 確認事項\n```']) {
+    assert.throws(() => assertTemplateStructure(description, task.templateDescription, 'markdown'), /模板章节/);
+  }
+  assertTemplateStructure('## 現状\n正文', '## 現状\n~~~\n## 示例而非章节\n~~~', 'markdown');
+  const setext = '现状\n====\n验收\n----';
+  assertTemplateStructure('现状\n====\n用户报告\n验收\n----\n待确认', setext, 'markdown');
+  assert.throws(() => assertTemplateStructure('正文', setext, 'markdown'), /模板章节/);
+});
+
+test('Backlog 记法章节与代码块按其本身语法验证', () => {
+  const template = '*現状\n** 対応内容\n{code:js}\n* 示例代码\n{/code}';
+  assertTemplateStructure('*現状\n报告\n** 対応内容\n待确认', template, 'backlog');
+  assert.throws(() => assertTemplateStructure('# 現状\n## 対応内容', template, 'backlog'), /模板章节/);
+});
+
+test('配置项目后自动读取当前 Task 模板，只传所选模板给两种协议，草稿和预览类型一致', async () => {
+  for (const protocol of ['responses', 'chat-completions']) {
+    const calls = [], logs = [];
+    const selectedConfig = { ...config, model: { ...config.model, protocol } };
+    const draft = await generateDraft(selectedConfig, { request: '关闭弹窗后不能滚动' }, { env: {}, log: line => logs.push(line), fetchImpl: async (url, options) => {
+      calls.push([String(url), options.method]);
+      assert.equal(options.redirect, 'error');
+      if (options.method === 'GET') {
+        assert.equal(url.origin, origin);
+        assert.equal(url.searchParams.get('apiKey'), 'backlog-test-secret');
+        if (url.pathname.endsWith('issueTypes')) return json([{ name: 'Bug', templateDescription: 'OTHER_TYPE_SENTINEL' }, task]);
+        assert.equal(url.pathname, '/api/v2/projects/DEMO');
+        return json({ projectKey: 'DEMO', name: '测试项目', textFormattingRule: 'markdown' });
+      }
+      assert.equal(options.headers.Authorization, 'Bearer model-test-secret');
+      const body = JSON.parse(options.body);
+      const request = JSON.parse(protocol === 'responses' ? body.input[0].content[0].text : body.messages[1].content[0].text);
+      assert.equal(request.issueType, 'タスク');
+      assert.equal(request.template.summary, task.templateSummary);
+      assert.equal(request.template.description, task.templateDescription);
+      assert.equal(request.template.textFormattingRule, 'markdown');
+      assert(!options.body.includes('OTHER_TYPE_SENTINEL'));
+      assert(!options.body.includes('backlog-test-secret'));
+      assert(!options.body.includes('model-test-secret'));
+      assert((body.instructions || body.messages[0].content).includes('逐字保留章节标题及顺序'));
+      return response(completed, protocol);
+    } });
+    assert.equal(calls.filter(([, method]) => method === 'GET').length, 2);
+    assert.equal(calls.at(-1)[1], 'POST');
+    assert.equal(draft.issueType, 'タスク');
+    assert.equal(draft.description, completed.description);
+    assert(!JSON.stringify(draft).includes('test-secret'));
+    assert(logs.some(line => line.includes('タスク')));
+  }
+});
+
+test('读取失败、无 Task、空模板或畸形模板均在生成前停止，不假装已套模板', async () => {
+  for (const types of [[{ name: 'Bug' }], [{ name: 'Task', templateDescription: null }], [{ name: 'Task', templateDescription: {} }], null]) {
+    await assert.rejects(generateDraft(config, { request: '问题' }, { env: {}, fetchImpl: async (url, options) => {
+      assert.equal(options.method, 'GET');
+      return url.pathname.endsWith('issueTypes') ? json(types) : json({ projectKey: 'DEMO' });
+    } }), /类型|模板/);
+  }
+  await assert.rejects(generateDraft(config, { request: '问题' }, { env: {}, fetchImpl: async (url, options) => {
+    assert.equal(options.method, 'GET'); return { ok: false, status: 401 };
+  } }), /HTTP 401/);
+});
+
+test('模型忽略模板时不交付草稿；明确指定其他类型时使用其模板和类型', async () => {
+  const fetchDraft = output => async (url, options) => {
+    if (options.method === 'POST') return response(output);
+    return url.pathname.endsWith('issueTypes') ? json([task, { name: 'Bug', templateDescription: '## 原因' }]) : json({ projectKey: 'DEMO' });
+  };
+  await assert.rejects(generateDraft(config, { request: '问题' }, { env: {}, fetchImpl: fetchDraft({ ...completed, description: '没有模板章节' }) }), /模板章节/);
+  const draft = await generateDraft(config, { request: '问题', issueType: 'Bug' }, { env: {}, fetchImpl: fetchDraft({ ...completed, description: '## 原因\n待确认' }) });
+  assert.equal(draft.issueType, 'Bug');
+});
+
+test('显式不套模板或尚未配置 Backlog 时仍可只生成本地草稿', async () => {
+  for (const [selected, options] of [[config, { metadata: false }], [{ ...config, backlog: {} }, {}]]) {
+    const draft = await generateDraft(selected, { request: '问题', ...options }, { env: {}, fetchImpl: async (url, options) => {
+      assert.equal(options.method, 'POST');
+      return response(completed);
+    } });
+    assert.equal(draft.issueType, undefined);
+  }
+});

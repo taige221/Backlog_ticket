@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Ticket · 起票工作台</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="工作区导航">
+      <a class="brand" href="#" id="brand"><span class="brand-mark">t.</span><span>Ticket<small>起票工作台</small></span></a>
+      <button class="new-button" id="new-chat" data-mutation><span aria-hidden="true">＋</span> 新建对话</button>
+      <button id="recent-toggle" class="recent-toggle" aria-expanded="false" aria-controls="draft-list">草稿</button>
+      <div class="sidebar-heading">最近的草稿 <span id="draft-count">0</span></div>
+      <nav id="draft-list" class="draft-list" aria-label="最近的草稿"></nav>
+      <div class="sidebar-bottom"><span class="local-label"><i></i> 本机工作区</span><button id="settings-open" class="settings-link">配置工作台 <span aria-hidden="true">↗</span></button></div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div class="context-controls">
+          <div class="picker-wrap"><button id="project-picker" class="context-button" data-mutation aria-expanded="false">选择项目 <span>⌄</span></button><div id="project-menu" class="picker-menu" hidden></div></div>
+          <span class="context-divider">/</span>
+          <div class="picker-wrap"><button id="type-picker" class="context-button" data-mutation aria-expanded="false">工单类型 <span>⌄</span></button><div id="type-menu" class="picker-menu" hidden></div></div>
+          <span class="context-divider">/</span>
+          <div class="picker-wrap"><button id="category-picker" class="context-button" data-mutation aria-expanded="false">分类（可选） <span>⌄</span></button><div id="category-menu" class="picker-menu" hidden></div></div>
+        </div>
+        <div class="session-tools"><details id="usage-panel" class="usage-panel"><summary id="usage-caption">用量与费用</summary><div class="usage-card"><h3>当前对话</h3><p id="conversation-usage">尚未调用模型</p><h3>当前 API Key</h3><p id="account-usage">展开后读取服务商数据</p><p id="local-account-usage"></p><p class="usage-hint">本机记录从启用此功能开始；失败请求也可能计费。服务商按 UTC 统计日／月用量。</p><button id="refresh-usage" class="small-button" type="button">刷新用量</button></div></details><div class="picker-wrap model-wrap"><button id="model-picker" class="model-button" data-mutation aria-expanded="false"><span class="model-dot"></span><span id="model-name">配置模型</span><span id="model-effort" hidden></span><span>⌄</span></button><div id="model-menu" class="picker-menu model-menu" hidden></div></div></div>
+      </header>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <div class="mobile-tabs" role="tablist" aria-label="工作区视图"><button id="chat-tab" role="tab" aria-selected="true">对话</button><button id="document-tab" role="tab" aria-selected="false">当前草稿</button></div>
+      <div class="workbench" data-mobile-view="chat" data-draft-collapsed="true">
+        <section class="conversation" aria-label="起票对话">
+          <div id="chat-log" class="chat-log" aria-live="polite">
+            <div id="welcome" class="welcome"><span class="eyebrow">从一个问题开始</span><h1>把问题说清楚，<br>剩下的交给 Ticket。</h1><p>描述遇到的问题，也可以附上截图。<br>我们会根据项目模板，整理成一份可确认的工单。</p><div class="welcome-note"><span aria-hidden="true">↳</span> 草稿生成后，可以预览、创建，或继续修改。</div></div>
+          </div>
+          <div id="preview-panel" class="preview-panel" hidden aria-live="polite"><div class="preview-header"><strong id="preview-title">官网预览</strong><span id="preview-state"></span></div><p id="preview-message"></p><div class="preview-actions"><button id="preview-continue" class="small-button" hidden data-mutation>已进入新建页，继续填入</button><button id="preview-close" class="text-button" hidden>关闭预览</button></div></div>
+          <details id="issue-fields" class="issue-fields"><summary>日期与人员 <span id="fields-caption"></span></summary><div class="issue-field-grid"><label>开始日<input id="start-date" type="date" data-mutation></label><label>截止日<input id="due-date" type="date" data-mutation></label><div><span class="field-label">负责人（担当者，可选）</span><div class="picker-wrap"><button id="assignee-picker" class="field-picker" type="button" data-mutation aria-expanded="false">不指派</button><div id="assignee-menu" class="picker-menu people-menu" hidden></div></div></div><div><span class="field-label">通知其他人（可选）</span><div class="picker-wrap"><button id="notify-picker" class="field-picker" type="button" data-mutation aria-expanded="false">不通知其他人</button><div id="notify-menu" class="picker-menu people-menu" hidden></div></div></div></div><p class="field-hint">默认从今天开始，到下一个周五截止。通知在确认创建工单后发送。</p></details>
+          <div class="language-row"><label for="language">起票语言 <select id="language" data-mutation aria-describedby="language-hint"></select></label><span id="language-hint">标题和正文说明使用所选语言</span></div>
+          <form id="composer" class="composer">
+            <div id="composer-mode" class="composer-mode">描述一个需要处理的问题</div>
+            <label class="sr-only" for="request">问题描述或修改要求</label><textarea id="request" placeholder="例如：手机上查看书类配付详情时，按钮被挤到了画面外…" rows="3"></textarea>
+            <div id="upload-list" class="upload-list"></div>
+            <div class="composer-footer"><label class="attach-button" id="attach-label" title="添加截图或附件"><span aria-hidden="true">＋</span> 截图 / 附件<input id="files" type="file" multiple hidden></label><span id="composer-hint">可拖入文件，或粘贴截图</span><button id="stop-generation" class="secondary-button stop-generation" type="button" hidden>停止生成</button><button id="send" class="send-button" type="submit" data-mutation>整理草稿 <span aria-hidden="true">↑</span></button></div>
+          </form>
+          <p class="privacy-note">内容会发送至所选模型。附件保存在本机，可在配置工作台查看占用与清理。</p>
+        </section>
+        <section class="document-pane" aria-label="当前工单草稿">
+          <header class="document-toolbar"><div class="document-heading"><span class="eyebrow">当前草稿</span><span id="document-status" class="document-status">等待整理</span></div><button id="draft-toggle" class="draft-toggle" type="button" aria-expanded="false" aria-controls="draft-content">展开草稿</button></header>
+          <div id="draft-content" class="draft-content" hidden>
+          <div id="document-empty" class="document-empty"><div class="paper-symbol" aria-hidden="true"><span></span><span></span><span></span></div><h2>你的工单，从这里成形。</h2><p>对话生成的标题、正文和附件<br>会显示在这里，随时检查。</p><span class="document-empty-label">描述 → 整理 → 确认</span></div>
+          <article id="document" class="document" hidden><div id="document-meta" class="document-meta"></div><h2 id="draft-title"></h2><div id="draft-fields" class="draft-fields"></div><div id="draft-body" class="draft-body"></div><div id="unknowns" class="unknowns" hidden><h3>待确认事项</h3><ul id="unknown-list"></ul></div><div id="document-files" class="document-files"></div><a id="issue-link" class="issue-link" target="_blank" rel="noopener noreferrer" hidden></a></article>
+          <form id="draft-editor" class="document-editor" hidden>
+            <label for="edit-title">标题</label><input id="edit-title" type="text" required maxlength="255" data-edit-control>
+            <label for="edit-body">正文</label><textarea id="edit-body" required maxlength="40000" rows="16" spellcheck="false" aria-describedby="edit-hint" data-edit-control></textarea>
+            <p id="edit-hint">可将正文中的图片引用剪切到对应段落。保存会更新正文里的附件引用。</p>
+            <div class="edit-attachments" aria-labelledby="edit-attachments-label">
+              <strong id="edit-attachments-label">附件</strong>
+              <div id="edit-files-list" class="upload-list"></div>
+              <button id="add-edit-files" class="small-button" type="button" data-edit-control>添加附件</button>
+              <input id="edit-file-input" type="file" multiple hidden data-edit-control>
+              <p>也可拖入文件，或在正文框粘贴截图。</p>
+              <label id="edit-ai-option" hidden><input id="edit-ai" type="checkbox" data-edit-control> 发送新增截图给 AI，补充正文</label>
+              <p id="edit-ai-limit" hidden>可直接保存附件。每次最多发送 5 张新增截图给 AI。</p>
+            </div>
+          </form>
+          <footer id="draft-edit-actions" class="draft-actions" hidden><button id="cancel-edit" class="secondary-button" type="button" data-edit-control>取消编辑</button><button id="stop-edit-generation" class="secondary-button" type="button" hidden>停止生成</button><button id="save-edit" class="primary-button" type="submit" form="draft-editor" data-edit-control>保存修改</button></footer>
+          <footer id="draft-actions" class="draft-actions" hidden><button id="edit-draft" class="small-button draft-edit" type="button" data-mutation>编辑草稿与附件</button><button id="copy-title" class="small-button" type="button">复制标题</button><button id="copy-body" class="small-button" type="button">复制正文</button><button id="open-preview" class="secondary-button" data-mutation>官网预览 <span aria-hidden="true">↗</span></button><button id="create" class="primary-button" data-mutation>创建工单</button><button id="check-submission" class="small-button" type="button" hidden data-mutation>核对创建结果</button><button id="delete-draft" class="text-button draft-delete" type="button" data-mutation data-draft-delete>删除草稿</button><p id="draft-action-note">直接输入修改要求，即可继续调整草稿。</p></footer>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <dialog id="settings" class="settings-dialog" aria-labelledby="settings-title"><div class="dialog-header"><div><span class="eyebrow">工作区设置</span><h2 id="settings-title">配置工作台</h2></div><button class="icon-button" id="settings-close" aria-label="关闭配置">×</button></div><p class="dialog-intro">首次配置后即可使用。各项单独保存，密钥不会回显。</p><div id="settings-error" class="form-message" role="alert" hidden></div><form id="api-form" class="config-section"><div class="section-title"><h3>01 <span>模型 API</span></h3><span id="api-status" class="config-status"></span></div><label for="provider">服务商</label><select id="provider"><option value="auto">自动识别</option><option value="openrouter">OpenRouter</option><option value="openai">OpenAI</option></select><label for="api-key">API Key</label><input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="输入 API Key，自动完成配置"><div class="section-footer"><span>已配置时，留空保留现有密钥。</span><button class="small-button" type="submit" data-mutation>保存模型配置</button></div></form><form id="backlog-form" class="config-section"><div class="section-title"><h3>02 <span>Backlog</span></h3><span id="backlog-status" class="config-status"></span></div><label for="backlog-origin">Backlog 地址</label><input id="backlog-origin" type="url" placeholder="https://your-space.backlog.com" spellcheck="false"><label for="backlog-key">Backlog API Key</label><input id="backlog-key" type="password" autocomplete="off" spellcheck="false" placeholder="输入 API Key；已配置可留空"><div class="section-footer"><span>保存后，可在顶部切换项目和工单类型。</span><button class="small-button" type="submit" data-mutation>保存 Backlog 配置</button></div></form><form id="repo-form" class="config-section"><div class="section-title"><h3>03 <span>代码目录</span></h3><span class="config-status">可选</span></div><label id="repo-label" for="repo">本机代码目录</label><div class="folder-input"><input id="repo" type="text" placeholder="不填写也可以生成工单" spellcheck="false"><button id="choose-folder" class="small-button" type="button" data-mutation>选择文件夹</button></div><div class="section-footer"><span>各项目分别保存。相关源码会发给模型，留空可清除目录。</span><button class="small-button" type="submit" data-mutation>保存代码目录</button></div></form><section class="config-section" aria-labelledby="storage-title"><div class="section-title"><h3 id="storage-title">04 <span>本机附件存储</span></h3></div><p id="storage-usage" class="storage-copy" aria-live="polite">打开配置时读取附件占用</p><p id="storage-path" class="storage-path"></p><p id="storage-detail" class="storage-copy"></p><p class="storage-copy">为恢复草稿和官网预览，附件会保存在本机。移除待用附件或切换对话时会释放对应文件；已保存草稿引用的附件继续保留。</p><div class="section-footer"><button id="refresh-storage" class="small-button" type="button" data-mutation>刷新占用</button><button id="cleanup-storage" class="small-button" type="button" data-mutation hidden>清理未使用附件</button></div><p id="storage-result" class="storage-copy" role="status"></p></section><footer class="settings-footer"><span><i></i> 配置与草稿保存在本机</span><button id="shutdown" class="text-button">退出应用</button></footer></dialog>
+  <dialog id="confirm-create" class="confirm-dialog" aria-labelledby="confirm-title"><span class="eyebrow">最后确认</span><h2 id="confirm-title">创建这张工单？</h2><p id="confirm-summary"></p><div id="confirm-target" class="confirm-target"></div><p class="confirm-copy">确认后会提交到 Backlog，并上传草稿中的附件。</p><div class="confirm-actions"><button id="create-cancel" class="secondary-button">继续检查</button><button id="create-confirm" class="primary-button" data-mutation>创建工单</button></div></dialog>
+  <dialog id="submission-check" class="submission-dialog" aria-labelledby="submission-check-title">
+    <div class="dialog-header"><h2 id="submission-check-title">核对创建结果</h2><button id="submission-check-close" class="icon-button" type="button" aria-label="关闭核对" data-mutation>×</button></div>
+    <p class="dialog-intro">找到对应工单后，查看正文和创建信息，再确认关联。</p>
+    <p id="submission-check-error" class="form-message" role="alert" hidden></p>
+    <form id="submission-search" class="submission-search"><label for="submission-keyword">搜索标题</label><div><input id="submission-keyword" maxlength="255" required data-mutation><button class="small-button" type="submit" data-mutation>搜索</button></div></form>
+    <div id="submission-results" class="submission-results" aria-live="polite"></div>
+    <button id="submission-more" class="text-button" type="button" hidden data-mutation>加载更多</button>
+    <form id="submission-lookup" class="submission-search"><label for="submission-key">已有工单编号或链接</label><div><input id="submission-key" required placeholder="如 PROJECT-123" data-mutation><button class="small-button" type="submit" data-mutation>读取工单</button></div></form>
+    <section id="submission-detail" class="submission-detail" hidden></section>
+    <p class="confirm-copy">确认后会在本机记录关联的工单。尚未找到时，可稍后再核对。</p>
+    <div class="confirm-actions"><button id="submission-link" class="primary-button" type="button" disabled data-mutation>确认关联此工单</button></div>
+  </dialog>
+</body>
+</html>
