@@ -63,4 +63,11 @@ CLI 可运行 `npm run ticket -- init` 配置、`npm run ticket -- chat` 起票�
 
 工作流合入默认分支后，打开仓库的「Actions → 打包 Ticket → Run workflow」，选分支和平台。Apple 芯片选 `macos-15`，Intel Mac 选 `macos-15-intel`，Windows x64 选 `windows-2025`。
 
-构建完成后，在该次运行的「Artifacts」下载 ZIP，文件名包含平台和提交编号，保留 7 天。打包时使用仓库中的源码，无需填写模型或 Backlog 密钥。
+构建完成后，在该次运行的「Artifacts」下载 ZIP（需登录 GitHub，保留 7 天）。默认分支的构建还会发布到 Releases，下载链接固定、无需 GitHub 账号，可直接发给同事：
+
+- 下载页：<https://github.com/taige221/Backlog_ticket/releases>
+- Apple 芯片 Mac：<https://github.com/taige221/Backlog_ticket/releases/download/pkg-darwin-arm64/Ticket-web-darwin-arm64.zip>
+- Intel Mac：<https://github.com/taige221/Backlog_ticket/releases/download/pkg-darwin-x64/Ticket-web-darwin-x64.zip>
+- Windows x64：<https://github.com/taige221/Backlog_ticket/releases/download/pkg-win32-x64/Ticket-web-win32-x64.zip>
+
+三个链接固定不变，内容为各自平台最近一次构建；构建时间、提交编号和 Node 版本见 Release 说明和包内 `build-manifest.json`。打包使用仓库中的源码，无需填写模型或 Backlog 密钥。

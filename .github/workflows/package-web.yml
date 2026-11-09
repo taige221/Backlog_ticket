@@ -14,7 +14,7 @@ on:
           - windows-2025
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   package:
@@ -116,3 +116,23 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 7
+
+      - name: 发布到 Releases（无需 GitHub 账号的下载链接）
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TICKET_ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          $platform = node -p "process.platform + '-' + process.arch"
+          $tag = "pkg-$platform"
+          $asset = "dist/Ticket-web-$platform.zip"
+          Copy-Item -LiteralPath $env:TICKET_ZIP -Destination $asset -Force
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { gh release delete $tag --yes --cleanup-tag }
+          $notes = @"
+          无需 GitHub 账号即可下载。链接固定指向该平台最近一次构建。
+          提交：$env:GITHUB_SHA
+          构建时间（UTC）：$((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm'))
+          Node：$((node --version))；包内 build-manifest.json 记录完整信息。
+          "@
+          gh release create $tag $asset --target $env:GITHUB_SHA --title "Ticket 起票工作台 · $platform" --notes $notes --latest=false
