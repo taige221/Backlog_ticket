@@ -57,6 +57,8 @@ npx playwright install chromium
 npm run web
 ```
 
+Backlog 工单类型的标题和正文模板都可选。工作台会使用已配置的部分。用 `npm run web -- --no-template` 启动可主动跳过本次运行中所有工单类型的模板。
+
 CLI 可运行 `npm run ticket -- init` 配置、`npm run ticket -- chat` 起票，或用 `npm run ticket -- --help` 查看命令。可在对应架构的 macOS 或 Windows 上运行 `npm run package:web` 生成发行包。
 
 ## 在 GitHub 打包

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { selectIssueType, assertTemplateStructure, cleanSummary } from '../src/templates.js';
+import { selectIssueType, matchesTemplateStructure, cleanSummary } from '../src/templates.js';
 import { generateDraft } from '../src/draft.js';
 import { credentials, exampleConfig } from '../src/config.js';
 
@@ -60,20 +60,20 @@ test('Task 别名只匹配实际可用类型，明确指定的类型优先，不
 });
 
 test('Markdown 模板章节必须按原顺序保留，代码块里的假章节不能通过检查', () => {
-  assertTemplateStructure(completed.description, task.templateDescription, 'markdown');
+  assert(matchesTemplateStructure(completed.description, task.templateDescription, 'markdown'));
   for (const description of ['## 現状\n问题', '## 確認事項\n## 対応内容\n## 現状', '```md\n## 現状\n## 対応内容\n## 確認事項\n```']) {
-    assert.throws(() => assertTemplateStructure(description, task.templateDescription, 'markdown'), /模板章节/);
+    assert.equal(matchesTemplateStructure(description, task.templateDescription, 'markdown'), false);
   }
-  assertTemplateStructure('## 現状\n正文', '## 現状\n~~~\n## 示例而非章节\n~~~', 'markdown');
+  assert(matchesTemplateStructure('## 現状\n正文', '## 現状\n~~~\n## 示例而非章节\n~~~', 'markdown'));
   const setext = '现状\n====\n验收\n----';
-  assertTemplateStructure('现状\n====\n用户报告\n验收\n----\n待确认', setext, 'markdown');
-  assert.throws(() => assertTemplateStructure('正文', setext, 'markdown'), /模板章节/);
+  assert(matchesTemplateStructure('现状\n====\n用户报告\n验收\n----\n待确认', setext, 'markdown'));
+  assert.equal(matchesTemplateStructure('正文', setext, 'markdown'), false);
 });
 
 test('Backlog 记法章节与代码块按其本身语法验证', () => {
   const template = '*現状\n** 対応内容\n{code:js}\n* 示例代码\n{/code}';
-  assertTemplateStructure('*現状\n报告\n** 対応内容\n待确认', template, 'backlog');
-  assert.throws(() => assertTemplateStructure('# 現状\n## 対応内容', template, 'backlog'), /模板章节/);
+  assert(matchesTemplateStructure('*現状\n报告\n** 対応内容\n待确认', template, 'backlog'));
+  assert.equal(matchesTemplateStructure('# 現状\n## 対応内容', template, 'backlog'), false);
 });
 
 test('配置项目后自动读取当前 Task 模板，只传所选模板给两种协议，草稿和预览类型一致', async () => {
@@ -112,25 +112,29 @@ test('配置项目后自动读取当前 Task 模板，只传所选模板给两�
   }
 });
 
-test('读取失败、无 Task、空模板或畸形模板均在生成前停止，不假装已套模板', async () => {
-  for (const types of [[{ name: 'Bug' }], [{ name: 'Task', templateDescription: null }], [{ name: 'Task', templateDescription: {} }], null]) {
+test('读取失败、无 Task 或工单类型列表无效时停止生成', async () => {
+  for (const types of [[{ name: 'Bug' }], [{ name: '' }], null]) {
     await assert.rejects(generateDraft(config, { request: '问题' }, { env: {}, fetchImpl: async (url, options) => {
       assert.equal(options.method, 'GET');
       return url.pathname.endsWith('issueTypes') ? json(types) : json({ projectKey: 'DEMO' });
-    } }), /类型|模板/);
+    } }), /类型/);
   }
   await assert.rejects(generateDraft(config, { request: '问题' }, { env: {}, fetchImpl: async (url, options) => {
     assert.equal(options.method, 'GET'); return { ok: false, status: 401 };
   } }), /HTTP 401/);
 });
 
-test('模型忽略模板时不交付草稿；明确指定其他类型时使用其模板和类型', async () => {
+test('模型漏掉模板章节时仍交付新草稿并提示，明确指定类型时使用其模板', async () => {
   const fetchDraft = output => async (url, options) => {
     if (options.method === 'POST') return response(output);
     return url.pathname.endsWith('issueTypes') ? json([task, { name: 'Bug', templateDescription: '## 原因' }]) : json({ projectKey: 'DEMO' });
   };
-  await assert.rejects(generateDraft(config, { request: '问题' }, { env: {}, fetchImpl: fetchDraft({ ...completed, description: '没有模板章节' }) }), /模板章节/);
-  const draft = await generateDraft(config, { request: '问题', issueType: 'Bug' }, { env: {}, fetchImpl: fetchDraft({ ...completed, description: '## 原因\n待确认' }) });
+  const logs = [];
+  const description = '## 现象\n关闭弹窗后无法滚动';
+  const withoutHeadings = await generateDraft(config, { request: '问题' }, { env: {}, log: message => logs.push(message), fetchImpl: fetchDraft({ ...completed, description }) });
+  assert.equal(withoutHeadings.description, description);
+  assert(logs.some(message => message.includes('与工单模板不一致')));
+  const draft = await generateDraft(config, { request: '问题', issueType: 'Bug' }, { env: {}, warn: message => assert.fail(message), fetchImpl: fetchDraft({ ...completed, description: '## 原因\n待确认' }) });
   assert.equal(draft.issueType, 'Bug');
 });
 

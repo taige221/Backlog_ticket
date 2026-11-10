@@ -65,12 +65,13 @@ export function bodyHeadings(text, format) {
   return result;
 }
 
-export function assertTemplateStructure(description, template, format) {
+export function matchesTemplateStructure(description, template, format) {
   const expected = bodyHeadings(template, format).map(item => item.title), actual = bodyHeadings(description, format).map(item => item.title);
   let position = 0;
   for (const heading of expected) {
     position = actual.indexOf(heading, position);
-    if (position < 0) throw new Error('模型未保留模板章节或顺序，未保存草稿，请重试');
+    if (position < 0) return false;
     position++;
   }
+  return true;
 }

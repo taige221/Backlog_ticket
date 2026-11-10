@@ -7,7 +7,7 @@ import { createWebApp, trustedRequest } from '../src/web-server.js';
 import { saveJson, exampleConfig } from '../src/config.js';
 
 const json = data => ({ ok: true, status: 200, json: async () => data });
-async function fixture(t, overrides = {}) {
+async function fixture(t, { issueTypes, ...overrides } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), 'ticket-web-test-')), filename = path.join(root, 'config.json');
   const c = { ...exampleConfig, model: { ...exampleConfig.model, name: 'test-model' }, backlog: { origin: 'https://fixture.backlog.com', project: 'DEMO' } };
   await saveJson(filename, c);
@@ -16,7 +16,7 @@ async function fixture(t, overrides = {}) {
     fetchImpl: async (url, options) => {
       const route = new URL(url).pathname; seen.push({ route, ...options });
       if (route.endsWith('/models')) return json({ data: [{ id: 'test-model' }, { id: 'other-model' }] });
-      if (route.endsWith('/issueTypes')) return json([{ id: 18, name: 'Task', templateDescription: '## 現状\n\n## 期待' }, { id: 19, name: 'Bug', templateDescription: '## 現状\n\n## 期待' }]);
+      if (route.endsWith('/issueTypes')) return json(issueTypes ?? [{ id: 18, name: 'Task', templateDescription: '## 現状\n\n## 期待' }, { id: 19, name: 'Bug', templateDescription: '## 現状\n\n## 期待' }]);
       if (route.endsWith('/projects')) return json([{ projectKey: 'DEMO', name: '测试项目' }, { projectKey: 'OTHER', name: '另一项目' }]);
       if (route.endsWith('/priorities')) return json([{ id: 8, name: 'Normal' }]);
       if (route.endsWith('/categories')) return json([{ id: 31, name: 'frontend' }, { id: 42, name: 'backend' }]);
@@ -80,6 +80,47 @@ test('web draft/revision/create preserves named attachments and locks every revi
   assert.equal(app.seen.filter(item => item.route.endsWith('/issues')).length, 1);
   assert.equal(app.seen.find(item => item.route.endsWith('/attachment')).body.get('file').name, '证据.txt');
   assert(!JSON.stringify(state).includes('PRIVATE'));
+});
+
+test('web can generate and create issues with an unusable or disabled template', async t => {
+  const types = [
+    { name: '仕様共有', templateSummary: '[仕様共有]', templateDescription: null },
+    { name: 'オンボーディング' },
+    { name: 'バグ', templateDescription: '  \n' },
+    { name: '改善', templateDescription: {} },
+    { name: 'タスク', templateSummary: '[改善]', templateDescription: '## 未使用のテンプレート' },
+  ];
+  for (const type of types) {
+    const noTemplate = type.name === 'タスク';
+    const app = await fixture(t, { noTemplate, issueTypes: [{ id: 18, ...type }] });
+    await app.post('type', { type: type.name });
+    await app.post('category', { category: 'frontend' });
+    const { draft, warning } = await app.post('draft', { request: '手机布局问题', uploadIds: [] });
+    assert.equal(warning, undefined);
+    assert.equal(draft.target.project, 'DEMO');
+    assert.equal(draft.issueType, type.name);
+    assert.equal(draft.category, 'frontend');
+    const modelCall = app.seen.find(item => item.route.endsWith('/responses'));
+    const request = JSON.parse(JSON.parse(modelCall.body).input[0].content[0].text);
+    if (type.name === '仕様共有') {
+      assert.equal(request.template.summary, '[仕様共有]');
+      assert.equal(request.template.description, '');
+    } else {
+      assert.equal(request.template, undefined);
+    }
+    assert.equal(request.textFormattingRule, 'markdown');
+    assert.equal((await app.post('create', { id: draft.id })).issue.issueKey, 'DEMO-51');
+  }
+});
+
+test('web saves a new draft and reports a warning when template headings differ', async t => {
+  const app = await fixture(t, { issueTypes: [{ id: 18, name: 'タスク', templateDescription: '## 期待\n\n## 現状' }] });
+  const { draft, warning } = await app.post('draft', { request: '手机布局问题', uploadIds: [] });
+  assert.match(warning, /与工单模板不一致/);
+  const saved = await app.get(`drafts/${draft.id}`);
+  assert.match(saved.draft.description, /^## 現状[\s\S]+## 期待/);
+  const { activity } = await app.get(`activity/${draft.generationId}`);
+  assert.equal(activity.warning, warning);
 });
 
 test('重新打开草稿恢复当前分支的原始描述和修改，模型沿用该分支上下文', async t => {

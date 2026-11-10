@@ -47,7 +47,7 @@ export async function chooseFolder() {
   throw userError('此系统请手动输入代码目录路径');
 }
 
-export async function createWebApp({ filename = resolveConfigFile(), fetchImpl = fetch, env = process.env, preview = openPreview, folder = chooseFolder } = {}) {
+export async function createWebApp({ filename = resolveConfigFile(), fetchImpl = fetch, env = process.env, preview = openPreview, folder = chooseFolder, noTemplate = false } = {}) {
   filename = path.resolve(filename);
   const dataDir = path.dirname(filename), draftDir = path.join(dataDir, 'drafts'), uploadDir = path.join(dataDir, 'uploads');
   const lifecycle = new AbortController();
@@ -692,9 +692,12 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
         try {
           signal.throwIfAborted();
           if (previous) await saveTurn();
+          let templateWarning;
           const generated = await generateDraft(c, { request, previousDraft: before, conversation, language: body.language, repo: attachmentEdit ? '' : undefined,
-            reviewScreenshots,
-            images, attachments, issueType: before?.issueType, assignee: before ? before.assignee : body.assignee || undefined, startDate: before ? before.startDate : body.startDate, dueDate: before ? before.dueDate : body.dueDate, notifiedUsers: before ? before.notifiedUsers : body.notifiedUsers }, { fetchImpl: fetchSafe, env, log: active.log, onEvent: active.onEvent, signal });
+            reviewScreenshots, noTemplate,
+            images, attachments, issueType: before?.issueType, assignee: before ? before.assignee : body.assignee || undefined, startDate: before ? before.startDate : body.startDate, dueDate: before ? before.dueDate : body.dueDate, notifiedUsers: before ? before.notifiedUsers : body.notifiedUsers }, {
+            fetchImpl: fetchSafe, env, log: active.log, warn: message => { templateWarning = message; }, onEvent: active.onEvent, signal,
+          });
           signal.throwIfAborted();
           let draft = generated;
           if (attachmentEdit) {
@@ -705,7 +708,7 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
           job.controller = null;
           draft.generationId = generationId;
           if (!previous) await saveTurn();
-          const warning = [readWarning, writeWarning].filter(Boolean).join(' ') || undefined;
+          const warning = [readWarning, writeWarning, templateWarning].filter(Boolean).join(' ') || undefined;
           await active.finish(undefined, warning);
           const saved = await saveDraft(draft, previous, id, rootId);
           return { draft: saved, activity: active.view(), warning };

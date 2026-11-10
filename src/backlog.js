@@ -134,11 +134,14 @@ export async function listIssueTypes(config, options) {
   const project = projectKey(config.backlog?.project);
   const types = await get(config, `projects/${project}/issueTypes`, options);
   if (!Array.isArray(types) || types.some(type =>
-    !type || typeof type.name !== 'string' || !type.name.trim() || /[\x00-\x1f\x7f-\x9f]/.test(type.name) ||
-    [type.templateSummary, type.templateDescription].some(value => value != null && typeof value !== 'string'))) {
-    throw new Error('Backlog 类型模板格式无效');
+    !type || typeof type.name !== 'string' || !type.name.trim() || /[\x00-\x1f\x7f-\x9f]/.test(type.name))) {
+    throw new Error('Backlog 工单类型列表格式无效');
   }
-  return types.map(({ name, templateSummary, templateDescription }) => ({ name, templateSummary: templateSummary || '', templateDescription: templateDescription || '' }));
+  return types.map(({ name, templateSummary, templateDescription }) => ({
+    name,
+    templateSummary: typeof templateSummary === 'string' ? templateSummary : '',
+    templateDescription: typeof templateDescription === 'string' ? templateDescription : '',
+  }));
 }
 
 // This adapter deliberately exposes GET only. Preview never calls add-issue.
@@ -150,7 +153,7 @@ export async function getProjectMetadata(config, { includeUsers = true, ...optio
     includeUsers ? get(config, `projects/${project}/users`, options) : [],
   ]);
   if (!info || info.projectKey !== project || !Array.isArray(users) || users.some(user => !user || typeof user.name !== 'string')) {
-    throw new Error('Backlog 项目或类型模板格式无效，未生成草稿');
+    throw new Error('Backlog 项目或成员列表格式无效，未生成草稿');
   }
   return {
     project: { key: info.projectKey, name: info.name, textFormattingRule: info.textFormattingRule },
