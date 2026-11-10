@@ -31,6 +31,7 @@ const draftWarnings = new Map();
 let languageChoice = 0;
 let accountLoading = false;
 let accountVersion = 0;
+let apiFormDirty = false;
 let editing = false;
 let editFiles = [];
 let replaceFileIndex;
@@ -135,6 +136,12 @@ async function run(action, settingsError = false, allowEditing = false) {
   }
 }
 
+function renderProviderFields() {
+  const provider = $('provider').value;
+  $('custom-api').hidden = provider !== 'custom';
+  $('claude-api').hidden = provider !== 'anthropic';
+}
+
 function renderConfig() {
   $('project-picker').replaceChildren(document.createTextNode(config.project || '选择项目'), el('span', '⌄'));
   $('type-picker').replaceChildren(document.createTextNode(config.issueType || '工单类型'), el('span', '⌄'));
@@ -142,9 +149,23 @@ function renderConfig() {
   $('model-effort').textContent = effortLevels[config.reasoningEffort] || '';
   $('model-effort').hidden = !config.model || !config.reasoningEffort || config.reasoningEffort === 'auto';
   $('model-picker').title = config.model ? `${config.model} · 思考强度 ${effortLevels[config.reasoningEffort] || '默认'}` : '配置模型';
-  $('api-status').textContent = config.apiKeyConfigured ? `${config.provider === 'openrouter' ? 'OpenRouter' : config.provider === 'openai' ? 'OpenAI' : '已配置'} · 密钥已保存` : '尚未配置';
+  const providers = config.modelProviders || [];
+  const selected = providers.find(provider => provider.id === config.provider);
+  $('api-status').textContent = config.apiKeyConfigured ? `${selected?.label || '已配置'} · 密钥已保存` : '尚未配置';
   $('backlog-status').textContent = config.backlogKeyConfigured ? '密钥已保存' : '尚未配置';
-  $('provider').value = ['openai', 'openrouter'].includes(config.provider) ? config.provider : 'auto';
+  const preserveApiForm = apiFormDirty || $('api-key').value !== '';
+  const formProvider = preserveApiForm ? $('provider').value : selected?.id || '';
+  const placeholder = new Option('请选择服务商', '');
+  placeholder.disabled = true;
+  $('provider').replaceChildren(placeholder, ...providers.map(({ id, label }) => new Option(label, id)));
+  $('provider').value = formProvider;
+  if (!preserveApiForm) {
+    $('claude-workspace').value = formProvider === 'anthropic' ? config.workspaceId || '' : '';
+    $('model-api-url').value = formProvider === 'custom' ? config.baseUrl : '';
+    $('model-api-protocol').value = formProvider === 'custom' && config.protocol === 'responses' ? 'responses' : 'chat-completions';
+    $('model-api-id').value = formProvider === 'custom' ? config.model : '';
+  }
+  renderProviderFields();
   $('backlog-origin').value = config.backlogOrigin || '';
   $('repo-label').textContent = config.project ? `${config.project} 的本机代码目录` : '本机代码目录（未选项目）';
   $('repo').value = config.repo || '';
@@ -908,15 +929,9 @@ async function openPicker(kind) {
       effortBox.append(el('p', config.model || '请选择模型', 'effort-model'), label,
         el('p', selected?.efforts.length ? '强度越高，通常耗时和用量越多。' : '当前未获取到此模型的可调档位，可使用默认设置。', 'picker-message'));
     };
-    if (result.error) {
-      menu.append(el('p', result.error.message, 'picker-message'));
-      if (config.model && config.reasoningEffort && config.reasoningEffort !== 'auto') {
-        menu.append(effortBox);
-        renderEffort();
-      }
-      return;
-    }
-    const choices = kind === 'model' ? result.models.map(name => ({ value: name, label: name })) : kind === 'project' ? result.projects.map(project => ({ value: project.key, label: project.key, detail: project.name })) : kind === 'category' ? [{ value: '', label: '不指定分类' }, ...result.categories.map(category => ({ value: category.name, label: category.name }))] : result.types.map(type => ({ value: type.name, label: type.name }));
+    if (result.error) menu.append(el('p', `${result.error.message}。可直接输入模型 ID。`, 'picker-message'));
+    const modelNames = result.models ?? (config.model ? [config.model] : []);
+    const choices = kind === 'model' ? modelNames.map(name => ({ value: name, label: name })) : kind === 'project' ? result.projects.map(project => ({ value: project.key, label: project.key, detail: project.name })) : kind === 'category' ? [{ value: '', label: '不指定分类' }, ...result.categories.map(category => ({ value: category.name, label: category.name }))] : result.types.map(type => ({ value: type.name, label: type.name }));
     const search = el('input'); search.type = 'search'; search.placeholder = kind === 'model' ? '搜索模型，或输入完整模型 ID' : '搜索'; search.setAttribute('aria-label', `搜索${kind === 'model' ? '模型' : kind === 'project' ? '项目' : kind === 'category' ? '分类' : '工单类型'}`);
     search.dataset.mutation = '';
     const options = el('div', undefined, 'picker-options');
@@ -1084,18 +1099,26 @@ $('settings-open').addEventListener('click', () => {
   void run(refreshStorage, true);
 });
 $('settings-close').addEventListener('click', () => $('settings').close());
+$('provider').addEventListener('change', renderProviderFields);
+$('api-form').addEventListener('input', () => { apiFormDirty = true; });
 $('api-form').addEventListener('submit', event => {
   event.preventDefault();
   const key = $('api-key').value.trim();
   if (!key) { $('api-key').focus(); return; }
   run(async () => {
     const provider = $('provider').value;
-    const result = await api('config/api', { key, ...(provider === 'auto' ? {} : { provider }) });
-    $('api-key').value = ''; config = result.config; renderConfig();
+    const custom = provider === 'custom' ? {
+      baseUrl: $('model-api-url').value.trim(), protocol: $('model-api-protocol').value, model: $('model-api-id').value.trim(),
+    } : {};
+    const workspace = provider === 'anthropic' ? { workspaceId: $('claude-workspace').value.trim() } : {};
+    const result = await api('config/api', { key, provider, ...custom, ...workspace });
+    $('api-key').value = '';
+    apiFormDirty = false;
+    config = result.config; renderConfig();
     accountVersion++;
     $('account-usage').textContent = '展开后读取服务商数据';
     await refreshUsage(); if ($('usage-panel').open) await loadAccount();
-    notify('模型 API 已配置。可在顶部选择模型。');
+    notify(config.model ? '模型 API 已保存。' : '模型 API 已保存。可在顶部选择模型。');
   }, true);
 });
 $('backlog-form').addEventListener('submit', event => {

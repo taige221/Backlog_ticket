@@ -61,7 +61,7 @@ test('思考强度按模型持久保存，切换及同服务更换密钥后保�
   const restored = (await loadConfig(file)).model;
   assert.equal(selectedEffort(restored), 'high');
   await assert.rejects(rememberEffort(file, { ...restored, name: 'vendor/plain' }, 'low'), /模型已改变/);
-  const updated = await setupSection(file, 'api', { askSecret: async () => 'sk-or-v1-test', ask: async () => assert.fail(), env: {}, log() {}, fetchImpl: async () => json({ data: {} }) });
+  const updated = await setupSection(file, 'api', { provider: 'openrouter', askSecret: async () => 'sk-or-v1-test', ask: async () => assert.fail(), env: {}, log() {}, fetchImpl: async () => json({ data: {} }) });
   assert.equal(selectedEffort(updated.model), 'high');
   await rememberEffort(file, updated.model, 'auto');
   assert.equal(selectedEffort((await loadConfig(file)).model), 'auto');
@@ -139,7 +139,7 @@ test('CLI 重新配置同一 API 后不会把会话模型的档位保存到其�
     env, ask: async () => lines.shift(), log: line => logs.push(line),
     configure: async () => {
       await rememberModel(file, initial.model, 'vendor/plain');
-      return setupSection(file, 'api', { askSecret: async () => 'sk-or-v1-test', ask: async () => assert.fail(), env, log() {}, fetchImpl: async () => json({ data: {} }) });
+      return setupSection(file, 'api', { provider: 'openrouter', askSecret: async () => 'sk-or-v1-test', ask: async () => assert.fail(), env, log() {}, fetchImpl: async () => json({ data: {} }) });
     },
     modelOptions: async ({ model }) => {
       assert.equal(model.name, config.model.name);

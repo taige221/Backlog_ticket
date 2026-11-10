@@ -131,7 +131,7 @@ test('修改校验原稿章节，不因线上模板更换或清空而迁移正�
       } });
       assert.equal(result.description, description); assert.deepEqual(result.unknowns, previous.unknowns);
     }
-    await assert.rejects(generateDraft({ ...base, model: { ...base.model, protocol } }, { request: '补充说明', previousDraft: previous }, { env, fetchImpl: async () => response(protocol, { summary: '标题', description: '## 背景\n替换原章节。', unknowns: [] }) }), /模板章节/);
+    await assert.rejects(generateDraft({ ...base, model: { ...base.model, protocol } }, { request: '补充说明', previousDraft: previous }, { env, fetchImpl: async () => response(protocol, { summary: '标题', description: '## 背景\n替换原章节。', unknowns: [] }) }), /原稿的章节/);
   }
 });
 

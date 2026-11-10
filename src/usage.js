@@ -31,7 +31,7 @@ export function modelAccount(config, env) {
 
 export async function accountUsage(config, { fetchImpl = fetch, env = process.env, signal } = {}) {
   const { model, openrouter } = modelAccount(config, env);
-  if (!openrouter) return { supported: false, provider: model.provider || 'openai', message: '该服务的普通 API Key 不提供账户账单；下方本机统计仅包含启用此功能后的调用。OpenAI 账户账单需额外管理权限，可在服务商控制台查看。' };
+  if (!openrouter) return { supported: false, provider: model.provider || 'openai', message: '账户账单请在服务商控制台查看。下方显示本机记录的调用用量。' };
   let response;
   try { response = await fetchImpl('https://openrouter.ai/api/v1/key', { method: 'GET', redirect: 'error', headers: { Authorization: `Bearer ${model.apiKey}` }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000) }); }
   catch { throw new Error('账户用量读取失败或超时，请稍后重试'); }

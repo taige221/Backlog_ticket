@@ -5,6 +5,14 @@ export function validModel(value) {
   return typeof value === 'string' && /^[^\s\x00-\x1f\x7f]{1,200}$/u.test(value);
 }
 
+export function modelHeaders(model) {
+  const headers = { Authorization: `Bearer ${model.apiKey}` };
+  if (model.provider === 'anthropic' && model.baseUrl === 'https://api.anthropic.com/v1' && model.workspaceId) {
+    headers['anthropic-workspace-id'] = model.workspaceId;
+  }
+  return headers;
+}
+
 export const effortLabels = { auto: '默认', none: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高' };
 
 export function selectedEffort(model) {
@@ -90,11 +98,16 @@ export async function listModelOptions(config, { fetchImpl = fetch, env = proces
   if (url.origin !== new URL(model.baseUrl).origin || url.username || url.password || url.search || url.hash) {
     throw new Error('模型列表路径必须与模型 API 同站点，且不含凭据、查询参数或片段');
   }
+  const headers = { ...modelHeaders(model), Accept: 'application/json' };
+  if (model.provider === 'anthropic' && model.baseUrl === 'https://api.anthropic.com/v1') {
+    url.searchParams.set('limit', '1000');
+    headers['anthropic-version'] = '2026-10-21';
+  }
   const timeout = AbortSignal.timeout(15_000);
   let response;
   try {
     response = await fetchImpl(url, { method: 'GET', redirect: 'error',
-      headers: { Authorization: `Bearer ${model.apiKey}`, Accept: 'application/json' },
+      headers,
       signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
   } catch {
     if (signal?.aborted) throw Object.assign(new Error('已取消模型列表读取'), { code: 'ABORT_ERR' });

@@ -5,6 +5,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { backlogConnection, credentials, httpUrl, modelConnection, projectKey, selectedProjectRepo } from './config.js';
 import { validModel, selectedEffort, effortLabels } from './models.js';
 import { selectedProjectType, selectedProjectCategory } from './backlog.js';
+import { providers } from './setup.js';
 
 const text = value => stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, '');
 
@@ -28,8 +29,8 @@ function keyStatus(config, kind, env) {
 export async function describeConfig(config, { env = process.env, filename } = {}) {
   const model = config.model || {}, backlog = config.backlog || {};
   const apiAddress = address(model.baseUrl);
-  const provider = apiAddress === 'https://api.openai.com/v1' || model.provider === 'openai' ? 'OpenAI'
-    : apiAddress === 'https://openrouter.ai/api/v1' || model.provider === 'openrouter' ? 'OpenRouter' : '自定义／未设置';
+  const provider = Object.hasOwn(providers, model.provider) ? providers[model.provider].label
+    : Object.values(providers).find(preset => preset.baseUrl && preset.baseUrl === apiAddress)?.label || '自定义／未设置';
   let project = '未设置';
   if (backlog.project) {
     try { project = projectKey(backlog.project); }

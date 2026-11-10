@@ -55,7 +55,7 @@ test('完整 init 配置两组密钥、可访问项目与代码目录，普通�
   const root = await directory(t), file = path.join(root, 'config.json');
   const source = path.join(root, 'code with spaces');
   await mkdir(source);
-  const terminal = ui(['sk-proj-fixture', 'backlog-fixture-secret'], [origin, '99', '2', `"${source}"`]);
+  const terminal = ui(['sk-proj-fixture', 'backlog-fixture-secret'], ['openai', origin, '99', '2', `"${source}"`]);
   const config = await setupConfig(file, { ...terminal, fetchImpl: fetchSetup });
   assert.equal(config.backlog.project, 'TWO');
   assert.equal(selectedProjectRepo(config), source);
@@ -74,7 +74,7 @@ test('已有配置全部回车保留，旧相对代码目录仍以配置位置�
   const root = await directory(t);
   await mkdir(path.join(root, 'source'));
   const file = await existing(root, './source');
-  const config = await setupConfig(file, { ...ui(['', ''], ['', '', '']), fetchImpl: fetchSetup });
+  const config = await setupConfig(file, { ...ui(['', ''], ['', '', '', '']), fetchImpl: fetchSetup });
   assert.equal(config.model.name, 'fixture-model');
   assert.equal(config.backlog.project, 'TWO');
   assert.equal(selectedProjectRepo(config), path.join(root, 'source'));
@@ -84,13 +84,13 @@ test('已有配置全部回车保留，旧相对代码目录仍以配置位置�
 
 test('代码目录可跳过或用减号清除；唯一可访问项目自动选定', async t => {
   const root = await directory(t), file = await existing(root, '/previous/source');
-  let config = await setupConfig(file, { ...ui(['', ''], ['', '-']), fetchImpl: async (url, options) => {
+  let config = await setupConfig(file, { ...ui(['', ''], ['', '', '-']), fetchImpl: async (url, options) => {
     const data = await fetchSetup(url, options);
     return url instanceof URL && url.origin === origin ? json([projects[0]]) : data;
   } });
   assert.equal(selectedProjectRepo(config), undefined); assert.equal(config.backlog.project, 'ONE');
   assert.equal(selectedProjectRepo(config, { origin, project: 'TWO' }), '/previous/source');
-  config = await setupConfig(file, { ...ui(['', ''], ['', 'ONE', '']), fetchImpl: fetchSetup });
+  config = await setupConfig(file, { ...ui(['', ''], ['', '', 'ONE', '']), fetchImpl: fetchSetup });
   assert.equal(selectedProjectRepo(config), undefined);
 });
 
@@ -98,7 +98,7 @@ test('目录无效时不覆盖任何现有设置或新密钥', async t => {
   const root = await directory(t), file = await existing(root);
   const before = await readFile(file, 'utf8'), auth = await readFile(credentialFile(file), 'utf8');
   for (const invalid of [path.join(root, 'missing'), file]) {
-    await assert.rejects(setupConfig(file, { ...ui(['sk-proj-new-key', ''], ['', '', invalid]), fetchImpl: async (url, options) => {
+    await assert.rejects(setupConfig(file, { ...ui(['sk-proj-new-key', ''], ['', '', '', invalid]), fetchImpl: async (url, options) => {
       if (String(url).startsWith('https://api.openai.com/')) return json({ data: [] });
       return fetchSetup(url, options);
     } }), /代码目录/);
@@ -115,7 +115,7 @@ test('Backlog 鉴权失败、网络异常或无效项目列表均不保存，错
     () => json({ error: 'backlog-fixture-secret' }),
     () => json([]),
   ]) {
-    await assert.rejects(setupConfig(file, { ...ui(['sk-proj-fixture', 'backlog-fixture-secret'], [origin]), fetchImpl: async (url, options) => {
+    await assert.rejects(setupConfig(file, { ...ui(['sk-proj-fixture', 'backlog-fixture-secret'], ['openai', origin]), fetchImpl: async (url, options) => {
       if (String(url).startsWith('https://api.openai.com/')) return fetchSetup(url, options);
       return response();
     } }), error => !error.message.includes('backlog-fixture-secret'));
@@ -127,7 +127,7 @@ test('Backlog 鉴权失败、网络异常或无效项目列表均不保存，错
 test('更改 Backlog 站点时禁止沿用已存密钥，必须重新输入；验证前不会发送到新站点', async t => {
   const root = await directory(t), file = await existing(root);
   const before = await readFile(file, 'utf8');
-  await assert.rejects(setupConfig(file, { ...ui(['', ''], ['https://other.backlog.com']), fetchImpl: async (url, options) => {
+  await assert.rejects(setupConfig(file, { ...ui(['', ''], ['', 'https://other.backlog.com']), fetchImpl: async (url, options) => {
     assert(String(url).startsWith('https://api.openai.com/'));
     return fetchSetup(url, options);
   } }), /其他站点/);
@@ -141,17 +141,32 @@ test('保留环境变量鉴权；取消代码目录输入不写配置', async t 
   await writeFile(file, JSON.stringify({ ...exampleConfig, backlog: { origin, project: 'TWO' } }));
   const env = { OPENAI_API_KEY: 'sk-proj-fixture', BACKLOG_API_KEY: 'backlog-fixture-secret' };
   const before = await readFile(file, 'utf8');
-  await assert.rejects(setupConfig(file, { ...ui(['', ''], ['', '', undefined]), env, fetchImpl: fetchSetup }), /取消/);
+  await assert.rejects(setupConfig(file, { ...ui(['', ''], ['', '', '', undefined]), env, fetchImpl: fetchSetup }), /取消/);
   assert.equal(await readFile(file, 'utf8'), before);
   await assert.rejects(readFile(credentialFile(file)), { code: 'ENOENT' });
-  const config = await setupConfig(file, { ...ui(['', ''], ['', '', '']), env, fetchImpl: fetchSetup });
+  const config = await setupConfig(file, { ...ui(['', ''], ['', '', '', '']), env, fetchImpl: fetchSetup });
   assert.equal(backlogConnection(config, env).apiKey, env.BACKLOG_API_KEY);
   assert.equal(config[credentials].backlog, undefined);
 });
 
+test('首次 init 可直接使用所选服务商的环境变量，且不保存其中的密钥', async t => {
+  const file = path.join(await directory(t), 'config.json');
+  const env = { OPENAI_API_KEY: 'sk-proj-fixture', BACKLOG_API_KEY: 'backlog-fixture-secret' };
+  await assert.rejects(setupConfig(file, {
+    ...ui([''], ['deepseek']), env, fetchImpl: async () => assert.fail('不能使用另一家服务商的 Key'),
+  }), /取消/);
+  await assert.rejects(readFile(file), { code: 'ENOENT' });
+
+  const config = await setupConfig(file, { ...ui(['', ''], ['openai', origin, 'TWO', '']), env, fetchImpl: fetchSetup });
+  assert.equal(config.model.provider, 'openai');
+  assert.equal(config.model.apiKeyEnv, 'OPENAI_API_KEY');
+  assert.equal(config.backlog.project, 'TWO');
+  assert.deepEqual(JSON.parse(await readFile(credentialFile(file), 'utf8')), {});
+});
+
 test('无环境变量时 metadata 拟稿使用 init 保存的 Backlog 密钥，模型仅收到元数据', async t => {
   const root = await directory(t), file = await existing(root);
-  const config = await setupConfig(file, { ...ui(['', ''], ['', 'ONE', '']), fetchImpl: fetchSetup });
+  const config = await setupConfig(file, { ...ui(['', ''], ['', '', 'ONE', '']), fetchImpl: fetchSetup });
   let reads = 0;
   const draft = await generateDraft(config, { request: '拟稿测试', project: 'TWO', metadata: true }, { env: {}, fetchImpl: async (url, options) => {
     if (options.method === 'GET') {
@@ -178,7 +193,7 @@ test('单独配置 api 不校验 Backlog 或代码目录，保留其配置与凭
   const root = await directory(t), file = await existing(root, '/missing/source');
   const oldAuth = JSON.parse(await readFile(credentialFile(file), 'utf8'));
   const config = await setupSection(file, 'api', {
-    ...ui(['sk-proj-updated'], []), fetchImpl: async (url, options) => {
+    ...ui(['sk-proj-updated'], ['']), fetchImpl: async (url, options) => {
       assert.equal(url.href, 'https://api.openai.com/v1/models');
       assert.equal(options.headers.Authorization, 'Bearer sk-proj-updated');
       return json({ data: [] });
@@ -258,7 +273,7 @@ test('config 帮助可非交互查看，非法配置命令在任何输入和写�
 test('对话 /api、/backlog、/repo 复用独立配置引导，持久化结果用于同次会话的拟稿', async t => {
   const root = await directory(t), file = await existing(root, '/old/source');
   const { loadConfig } = await import('../src/config.js');
-  const terminal = ui(['sk-proj-fixture', 'backlog-fixture-secret'], ['', 'ONE', root]);
+  const terminal = ui(['sk-proj-fixture', 'backlog-fixture-secret'], ['', '', 'ONE', root]);
   const commands = ['/model fixture-session-model', '/api', '/backlog', '/repo', '问题', '/exit'];
   let generated = 0;
   await runChat(await loadConfig(file), {

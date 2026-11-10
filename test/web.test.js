@@ -885,10 +885,77 @@ test('independent repo and API configuration keeps credentials out of state', as
   await app.post('config/repo', { repo: app.root });
   assert.equal((await app.get('state')).config.repo, await import('node:fs/promises').then(fs => fs.realpath(app.root)));
   await app.post('config/repo', { repo: '' });
-  await app.post('config/api', { key: 'sk-proj-WEB_PRIVATE_KEY' });
+  await app.post('config/api', { key: 'sk-proj-WEB_PRIVATE_KEY', provider: 'openai' });
   assert.equal((await app.get('state')).config.provider, 'openai');
   assert(!JSON.stringify(await app.get('state')).includes('WEB_PRIVATE_KEY'));
-  await assert.rejects(app.post('config/api', { key: 'unknown-key' }), /请选择/);
+  const count = app.seen.length;
+  await assert.rejects(app.post('config/api', { key: 'sk-proj-fixture' }), /请选择/);
+  await assert.rejects(app.post('config/api', { key: 'sk-or-v1-fixture', provider: 'auto' }), /请选择/);
+  assert.equal(app.seen.length, count);
+  const explicit = await app.post('config/api', { key: 'sk-or-v1-FIXTURE', provider: 'openai' });
+  assert.equal(explicit.config.provider, 'openai');
+  assert.equal(app.seen.at(-1).route, '/v1/models');
+  assert.equal(app.seen.at(-1).headers.Authorization, 'Bearer sk-or-v1-FIXTURE');
+});
+
+test('web API settings route preset and custom keys to their selected endpoints', async t => {
+  const calls = [];
+  const app = await fixture(t, { noTemplate: true, fetchImpl: async (url, options) => {
+    const address = new URL(url);
+    if (address.origin === 'https://fixture.backlog.com') {
+      return json(address.pathname.endsWith('/issueTypes') ? [{ name: 'Task' }] : { projectKey: 'DEMO', textFormattingRule: 'markdown' });
+    }
+    calls.push(address.href);
+    if (address.href === 'https://api.deepseek.com/models') {
+      assert.equal(options.headers.Authorization, 'Bearer preset-fixture-secret');
+      return json({ data: [{ id: 'fixture-model' }] });
+    }
+    assert.equal(address.href, 'https://gateway.example.test/api/v1/chat/completions');
+    assert.equal(options.headers.Authorization, 'Bearer sk-or-v1-custom-fixture-secret');
+    assert.equal(JSON.parse(options.body).model, 'team/model');
+    return json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ summary: '测试', description: '正文', unknowns: [] }) } }] });
+  } });
+  const preset = await app.post('config/api', { provider: 'deepseek', key: 'preset-fixture-secret' });
+  assert.equal(preset.config.provider, 'deepseek');
+  assert(preset.config.modelProviders.some(provider => provider.id === 'deepseek'));
+  await assert.rejects(app.post('config/api', { provider: 'custom', key: 'unused', baseUrl: 'https://gateway.example.test/v1?apiKey=bad', model: 'team/model' }), /不能含凭据/);
+  const custom = await app.post('config/api', { provider: 'custom', key: 'sk-or-v1-custom-fixture-secret', baseUrl: 'https://gateway.example.test/api/v1/', protocol: 'chat-completions', model: 'team/model' });
+  assert.equal(custom.config.model, 'team/model');
+  assert.equal(custom.config.protocol, 'chat-completions');
+  assert(!JSON.stringify(custom).includes('fixture-secret'));
+  assert.deepEqual(calls, ['https://api.deepseek.com/models']);
+  const { draft } = await app.post('draft', { request: '测试', uploadIds: [] });
+  assert.equal(draft.description, '正文');
+  assert.equal(calls.at(-1), 'https://gateway.example.test/api/v1/chat/completions');
+});
+
+test('Claude preset lists models and generates a draft with the configured workspace', async t => {
+  const workspaceId = 'wrkspc_fixture123';
+  const app = await fixture(t, { noTemplate: true, fetchImpl: async (url, options) => {
+    const address = new URL(url);
+    if (address.origin === 'https://fixture.backlog.com') {
+      return json(address.pathname.endsWith('/issueTypes') ? [{ name: 'Task' }] : { projectKey: 'DEMO', textFormattingRule: 'markdown' });
+    }
+    assert.equal(address.origin, 'https://api.anthropic.com');
+    assert.equal(options.headers.Authorization, 'Bearer claude-fixture-key');
+    assert.equal(options.headers['anthropic-workspace-id'], workspaceId);
+    if (options.method === 'GET') {
+      assert.equal(address.pathname, '/v1/models');
+      assert.equal(address.searchParams.get('limit'), '1000');
+      assert(options.headers['anthropic-version']);
+      return json({ data: [{ id: 'claude-fixture-model' }], has_more: false });
+    }
+    assert.equal(address.pathname, '/v1/chat/completions');
+    assert.equal(JSON.parse(options.body).model, 'claude-fixture-model');
+    return json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ summary: '测试', description: '正文', unknowns: [] }) } }] });
+  } });
+  const { config } = await app.post('config/api', { provider: 'anthropic', key: 'claude-fixture-key', workspaceId });
+  assert.equal(config.provider, 'anthropic');
+  assert(config.modelProviders.some(provider => provider.id === 'anthropic'));
+  assert(!JSON.stringify(config).includes('claude-fixture-key'));
+  assert.deepEqual((await app.get('models')).models, ['claude-fixture-model']);
+  await app.post('model', { model: 'claude-fixture-model' });
+  assert.equal((await app.post('draft', { request: '测试', uploadIds: [] })).draft.description, '正文');
 });
 
 test('saving Backlog retains a reachable selected project and first setup chooses an accessible project', async t => {

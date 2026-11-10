@@ -3,19 +3,29 @@ import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { credentials, credentialFile, exampleConfig, replacePrivateJson, loadConfig, modelConnection, httpUrl, migrateProjectRepo, selectedProjectRepo, withProjectRepo } from './config.js';
-import { listModels } from './models.js';
+import { listModels, validModel } from './models.js';
 import { listProjects } from './backlog.js';
 
 export const providers = {
-  openai: { baseUrl: 'https://api.openai.com/v1', protocol: 'responses', apiKeyEnv: 'OPENAI_API_KEY' },
-  openrouter: { baseUrl: 'https://openrouter.ai/api/v1', protocol: 'chat-completions', apiKeyEnv: 'OPENROUTER_API_KEY' },
+  openai: { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', protocol: 'responses', apiKeyEnv: 'OPENAI_API_KEY' },
+  openrouter: { label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', protocol: 'chat-completions', apiKeyEnv: 'OPENROUTER_API_KEY' },
+  anthropic: { label: 'Claude（Anthropic）', baseUrl: 'https://api.anthropic.com/v1', protocol: 'chat-completions', apiKeyEnv: 'ANTHROPIC_API_KEY' },
+  deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com', protocol: 'chat-completions', apiKeyEnv: 'DEEPSEEK_API_KEY' },
+  kimi: { label: 'Kimi（月之暗面国内站）', baseUrl: 'https://api.moonshot.cn/v1', protocol: 'chat-completions', apiKeyEnv: 'MOONSHOT_API_KEY' },
+  gemini: { label: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', protocol: 'chat-completions', apiKeyEnv: 'GEMINI_API_KEY' },
+  qwen: { label: '阿里云百炼（北京）', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', protocol: 'chat-completions', apiKeyEnv: 'DASHSCOPE_API_KEY', defaultModel: 'qwen-plus' },
+  zhipu: { label: '智谱 GLM', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', protocol: 'chat-completions', apiKeyEnv: 'ZHIPU_API_KEY', defaultModel: 'glm-5.3' },
+  siliconflow: { label: '硅基流动（国内站）', baseUrl: 'https://api.siliconflow.cn/v1', protocol: 'chat-completions', apiKeyEnv: 'SILICONFLOW_API_KEY' },
+  ark: { label: '火山方舟（按量计费）', baseUrl: 'https://ark.cn-beijing.volces.com/api/v3', protocol: 'chat-completions', apiKeyEnv: 'ARK_API_KEY' },
+  custom: { label: '自定义 API' },
 };
 
-// Prefixes are routing hints, not proof that a credential is valid.
-export function detectProvider(key) {
-  if (key.startsWith('sk-or-v1-')) return 'openrouter';
-  if (/^sk-(proj-|svcacct-)/.test(key)) return 'openai';
-  return null;
+export function configuredProvider(model) {
+  if (!model?.baseUrl) return undefined;
+  if (model.provider === 'custom') return 'custom';
+  let baseUrl;
+  try { baseUrl = httpUrl(model.baseUrl, '模型 API 地址'); } catch { return undefined; }
+  return Object.keys(providers).find(id => providers[id].baseUrl === baseUrl) || 'custom';
 }
 
 async function readOptional(file) {
@@ -32,7 +42,22 @@ function validateKey(key) {
   if (!/^[\x21-\x7e]{1,4096}$/.test(key)) throw new Error('API Key 含空白或不支持的字符，未保存');
 }
 
-async function setup(filename, { ask, askSecret, log = console.log, fetchImpl = fetch, signal, env = process.env, scope = 'api', repoTarget } = {}) {
+async function promptCustomModel(ask, current) {
+  const answer = async question => {
+    const value = await ask(question);
+    if (value == null) throw new Error('已取消配置，原设置未更改');
+    return value.trim();
+  };
+  const baseUrl = httpUrl(await answer(`模型 API 地址（例如 https://gateway.example.com/v1${current?.baseUrl ? '，回车保留现有地址' : ''}）：`) || current?.baseUrl, '模型 API 地址');
+  const sameAddress = current?.baseUrl === baseUrl;
+  const defaultProtocol = sameAddress ? current.protocol : 'chat-completions';
+  const protocol = await answer(`接口协议 chat-completions / responses [${defaultProtocol}]：`) || defaultProtocol;
+  const previousName = sameAddress && current.protocol === protocol ? current.name : '';
+  const name = await answer(`模型 ID（${previousName ? `回车保留 ${previousName}` : '可留空，从模型列表选择'}）：`) || previousName;
+  return { baseUrl, protocol, name };
+}
+
+async function setup(filename, { ask, askSecret, log = console.log, fetchImpl = fetch, signal, env = process.env, scope = 'api', repoTarget, provider: requestedProvider, custom, workspaceId } = {}) {
   if (!['all', 'api', 'backlog', 'repo'].includes(scope)) throw new Error('配置项应为 api、backlog 或 repo');
   const complete = scope === 'all';
   filename = path.resolve(filename);
@@ -44,27 +69,62 @@ async function setup(filename, { ask, askSecret, log = console.log, fetchImpl = 
   const auth = oldAuth === null ? {} : parse(oldAuth);
   let next = { ...(scope === 'api' ? config : migrateProjectRepo(config)), [credentials]: auth };
   if (complete || scope === 'api') {
-    const key = (await askSecret(`请输入 OpenAI 或 OpenRouter API Key（隐藏输入，${complete ? '回车保留已有配置' : '回车取消'}）：`))?.trim();
-    if (key) {
-      validateKey(key);
-      let provider = detectProvider(key);
-      if (!provider) {
-        const answer = (await ask('无法仅凭密钥判断服务商。选择 1 OpenAI / 2 OpenRouter（回车取消）：'))?.trim().toLowerCase();
-        provider = { '1': 'openai', '2': 'openrouter', openai: 'openai', openrouter: 'openrouter' }[answer];
-        if (!provider) throw new Error('已取消配置，原设置未更改');
+    const current = config.model;
+    const currentProvider = original === null ? undefined : configuredProvider(current);
+    let provider = requestedProvider;
+    if (provider === undefined && ask) {
+      const choices = Object.entries(providers);
+      const menu = choices.map(([id, { label }], i) => `${i + 1}. ${label} (${id})`).join('\n');
+      const hint = currentProvider ? `回车选择 ${providers[currentProvider].label}` : '回车取消';
+      const answer = (await ask(`请选择服务商（${hint}）：\n${menu}\n输入编号或名称：`))?.trim().toLowerCase();
+      if (answer == null || (!answer && !currentProvider)) throw new Error('已取消配置，原设置未更改');
+      provider = answer ? choices[Number(answer) - 1]?.[0] ?? answer : currentProvider;
+    }
+    if (typeof provider !== 'string' || !Object.hasOwn(providers, provider)) throw new Error('请选择 API 服务商');
+    const selectedPreset = providers[provider];
+    const canKeepKey = complete && provider === currentProvider;
+    const presetKeyEnv = selectedPreset.apiKeyEnv;
+    const canUseEnv = complete && !canKeepKey && presetKeyEnv && env[presetKeyEnv] && !auth[provider]?.key;
+    const onEnter = canKeepKey ? '回车保留已有配置' : canUseEnv ? `回车使用环境变量 ${presetKeyEnv}` : '回车取消';
+    const key = (await askSecret(`请输入 ${selectedPreset.label} API Key（隐藏输入，${onEnter}）：`))?.trim();
+    if (key == null || (!key && !canKeepKey && !canUseEnv)) throw new Error('已取消配置，原设置未更改');
+    if (key || canUseEnv) {
+      if (key) validateKey(key);
+      let { label, baseUrl, protocol, apiKeyEnv, defaultModel } = selectedPreset;
+      let name;
+      if (provider === 'custom') {
+        const settings = custom ?? await promptCustomModel(ask, currentProvider === 'custom' ? current : undefined);
+        if (typeof settings.baseUrl !== 'string' || settings.baseUrl.length > 2048) throw new Error('请输入有效的模型 API 地址');
+        baseUrl = httpUrl(settings.baseUrl, '模型 API 地址');
+        protocol = settings.protocol ?? 'chat-completions';
+        if (!['responses', 'chat-completions'].includes(protocol)) throw new Error('请选择有效的模型 API 协议');
+        name = settings.name ?? '';
+        if (name !== '' && !validModel(name)) throw new Error('模型 ID 无效，未保存');
+        apiKeyEnv = 'MODEL_API_KEY';
       }
-      log(`已选择 ${provider === 'openai' ? 'OpenAI' : 'OpenRouter'}，正在做只读鉴权检查…`);
-      const preset = providers[provider];
-      const sameProvider = config.model?.baseUrl === preset.baseUrl && config.model?.protocol === preset.protocol;
-      next.model = { ...preset, provider, modelsPath: 'models', models: [], name: sameProvider ? config.model?.name || '' : '' };
-      if (sameProvider && config.model?.reasoningByModel) next.model.reasoningByModel = config.model.reasoningByModel;
-      next[credentials] = { ...auth, [provider]: { baseUrl: preset.baseUrl, key } };
-    } else if (!complete) {
-      throw new Error('已取消配置，原设置未更改');
+      const sameEndpoint = current?.baseUrl === baseUrl && current?.protocol === protocol;
+      const previousName = sameEndpoint ? current.name : '';
+      next.model = { baseUrl, protocol, apiKeyEnv, provider, modelsPath: 'models', models: [], name: name ?? (previousName || defaultModel || '') };
+      if (provider === 'anthropic') {
+        const savedWorkspace = sameEndpoint ? current.workspaceId : '';
+        const value = workspaceId ?? (ask ? (await ask(`Claude Workspace ID（${savedWorkspace ? '回车保留，输入 - 清除' : '非工作区专用 Key 需要，可留空'}）：`))?.trim() : '');
+        if (value == null) throw new Error('已取消配置，原设置未更改');
+        const workspace = workspaceId === undefined && value === '' ? savedWorkspace : value;
+        if (workspace && workspace !== '-') {
+          if (typeof workspace !== 'string' || !/^wrkspc_[a-z0-9]{1,120}$/i.test(workspace)) throw new Error('Claude Workspace ID 无效，未保存');
+          next.model.workspaceId = workspace;
+        }
+      }
+      if (sameEndpoint && current.reasoningByModel) next.model.reasoningByModel = current.reasoningByModel;
+      if (key) next[credentials] = { ...auth, [provider]: { baseUrl, key } };
+      log(`已选择 ${label}。`);
     }
     const connection = modelConnection(next, env);
-    // OpenRouter's public model catalog alone does not validate the supplied key.
-    if (connection.baseUrl === providers.openrouter.baseUrl) {
+    const preset = Object.hasOwn(providers, connection.provider) ? providers[connection.provider] : undefined;
+    if ((connection.provider === 'custom' && connection.name) || preset?.defaultModel) {
+      log('将在首次生成草稿时验证 API 密钥和模型。');
+    } else if (connection.baseUrl === providers.openrouter.baseUrl) {
+      // OpenRouter's public model catalog alone does not validate the supplied key.
       let response;
       try { response = await fetchImpl(`${connection.baseUrl}/key`, { method: 'GET', redirect: 'error', headers: { Authorization: `Bearer ${connection.apiKey}` }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000) }); }
       catch { throw new Error('OpenRouter 鉴权检查失败或已取消，未保存密钥'); }

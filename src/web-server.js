@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, resolveConfigFile, saveJson, modelConnection, backlogConnection, httpUrl, ticketLanguages, rememberLanguage, selectedProjectRepo } from './config.js';
-import { setupSection, detectProvider } from './setup.js';
+import { configuredProvider, providers, setupSection } from './setup.js';
 import { listModelOptions, rememberModel, rememberEffort, validateEffort, selectedEffort, effortLabels } from './models.js';
 import { listProjects, listIssueTypes, rememberProject, rememberProjectType, selectedProjectType, listCategories, resolveCategory, selectedProjectCategory, rememberProjectCategory, categorySummary, listProjectUsers, resolveProjectUser } from './backlog.js';
 import { generateDraft, readDraft, imageData, validateDraft, defaultSchedule, withDefaultSchedule } from './draft.js';
@@ -20,6 +20,7 @@ import { attachmentImages, inlineImageDescription, inspectScreenshotReview, rewr
 
 const exec = promisify(execFile);
 const assetRoot = fileURLToPath(new URL('../web/', import.meta.url));
+const modelProviders = Object.entries(providers).map(([id, { label }]) => ({ id, label }));
 const validId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,120}$/.test(value);
 const revisionParentId = value => {
   if (typeof value !== 'string' || !value.endsWith('.json')) return;
@@ -69,7 +70,8 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
     let apiKeyConfigured = false, backlogKeyConfigured = false;
     try { modelConnection(c, env); apiKeyConfigured = true; } catch { /* Configuration is optional at startup. */ }
     try { backlogConnection(c, env); backlogKeyConfigured = true; } catch { /* Never return stored keys. */ }
-    return { provider: c.model?.provider || '', model: c.model?.name || '', baseUrl: safeUrl(c.model?.baseUrl), reasoningEffort: selectedEffort(c.model), apiKeyConfigured,
+    const provider = c.model?.provider || apiKeyConfigured ? configuredProvider(c.model) || '' : '';
+    return { provider, modelProviders, model: c.model?.name || '', baseUrl: safeUrl(c.model?.baseUrl), protocol: c.model?.protocol, workspaceId: c.model?.workspaceId, reasoningEffort: selectedEffort(c.model), apiKeyConfigured,
       backlogOrigin: safeUrl(c.backlog?.origin, true), project: c.backlog?.project || '', issueType: selectedProjectType(c.backlog) || '', category: selectedProjectCategory(c.backlog) || '', backlogKeyConfigured, repo: selectedProjectRepo(c) || '', language: c.language || 'zh-CN' };
   };
   const draftFile = id => { if (!validId(id)) throw userError('草稿编号无效'); return path.join(draftDir, `${id}.json`); };
@@ -505,8 +507,10 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
       }
       if (route === '/api/config/api') {
         const key = text(body.key, 'API Key', 4096);
-        if (!detectProvider(key) && !['openai', 'openrouter'].includes(body.provider)) throw userError('请选择 OpenAI 或 OpenRouter 服务商');
-        await setupSection(filename, 'api', { ...deps, askSecret: async () => key, ask: async () => body.provider, log() {} });
+        await setupSection(filename, 'api', {
+          ...deps, askSecret: async () => key, provider: body.provider, workspaceId: body.workspaceId, log() {},
+          custom: { baseUrl: body.baseUrl, protocol: body.protocol, name: body.model },
+        });
         return { config: await snapshot() };
       }
       if (route === '/api/config/backlog') {

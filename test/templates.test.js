@@ -95,7 +95,7 @@ test('配置项目后自动读取当前 Task 模板，只传所选模板给两�
       const request = JSON.parse(protocol === 'responses' ? body.input[0].content[0].text : body.messages[1].content[0].text);
       assert.equal(request.issueType, 'タスク');
       assert.equal(request.template.summary, task.templateSummary);
-      assert.equal(request.template.description, task.templateDescription);
+      assert.equal(request.template.description, '## 現状\n\n## 対応内容\n\n## 確認事項\n- [ ] 実機確認');
       assert.equal(request.template.textFormattingRule, 'markdown');
       assert(!options.body.includes('OTHER_TYPE_SENTINEL'));
       assert(!options.body.includes('backlog-test-secret'));
@@ -110,6 +110,64 @@ test('配置项目后自动读取当前 Task 模板，只传所选模板给两�
     assert(!JSON.stringify(draft).includes('test-secret'));
     assert(logs.some(line => line.includes('タスク')));
   }
+});
+
+test('新草稿和修改稿省略模板填写提示，保留实际内容与固定检查项', async () => {
+  const currentHint = '(現在はどんな状態なのか、どんな課題があるのか)';
+  const expectedHint = '(どのような理想像になりたいか)';
+  const approachHint = '(具体的な対応案・お願い事項の記述)';
+  const check = '## チェックリスト\n- [ ] Safari で確認';
+  const approach = '## 対応案/お願い事項(nice to have)';
+  const template = `## 現状\n${currentHint}\n\n## 期待\n${expectedHint}\n\n${approach}\n${approachHint}\n\n${check}`;
+  const leaked = `## 現状\n${currentHint}\n上限是58万円。\n\n## 期待 ${expectedHint} 改为62万円（仅适用于扶養追加）。\n\n${approach}\n${approachHint} 调整上限。\n\n${check}`;
+  const cleaned = `## 現状\n上限是58万円。\n\n## 期待\n改为62万円（仅适用于扶養追加）。\n\n${approach}\n调整上限。\n\n${check}`;
+  const fetchImpl = async (url, options) => {
+    if (options.method === 'GET') return url.pathname.endsWith('issueTypes')
+      ? json([{ ...task, templateDescription: template }]) : json({ projectKey: 'DEMO', textFormattingRule: 'markdown' });
+    const sent = JSON.parse(JSON.parse(options.body).input[0].content[0].text);
+    if (sent.previousDraft) assert.equal(sent.previousDraft.description, cleaned);
+    else assert.equal(sent.template.description, `## 現状\n\n## 期待\n\n${approach}\n\n${check}`);
+    return response({ summary: '调整上限', description: leaked, unknowns: [] });
+  };
+  const deps = { env: {}, fetchImpl, warn: message => assert.fail(message) };
+  const draft = await generateDraft(config, { request: '调整上限' }, deps);
+  assert.equal(draft.description, cleaned);
+  const previousDraft = { ...draft, description: leaked };
+  const revised = await generateDraft(config, { request: '整理票面', previousDraft }, deps);
+  assert.equal(revised.description, cleaned);
+  assert.equal(previousDraft.description, leaked);
+});
+
+test('切换语言可翻译无模板草稿的通用标题，但仍校验章节顺序和模板固定标题', async () => {
+  const zh = '## 现象\n上限是58万円。\n\n## 预期\n改为62万円。\n\n## 待确认项\n生效时间。';
+  const ja = '## 現象\n上限は58万円。\n\n## 期待\n62万円に変更する。\n\n## 要確認事項\n適用時期。';
+  const run = ({ description, template = '## 現状\n\n## 期待', sentBody, ...options }) => generateDraft(config,
+    { request: '切换起票语言，保留章节结构', ...options }, { env: {}, fetchImpl: async (url, request) => {
+      if (request.method === 'GET') return url.pathname.endsWith('issueTypes')
+        ? json([{ ...task, templateDescription: template }]) : json({ projectKey: 'DEMO', textFormattingRule: 'markdown' });
+      const input = JSON.parse(JSON.parse(request.body).input[0].content[0].text);
+      assert.equal(input.previousDraft?.description, sentBody);
+      return response({ summary: '調整', description, unknowns: [] });
+    } });
+  const initial = await run({ noTemplate: true, language: 'zh-CN', description: zh });
+  const { templateHeadings, ...legacy } = initial;
+  assert.deepEqual(templateHeadings, []);
+  const sentBody = zh.replace('现象', '現象').replace('预期', '期待').replace('待确认项', '要確認事項');
+  for (const previousDraft of [initial, legacy]) {
+    const revised = await run({ previousDraft, language: 'ja', sentBody, description: ja.replace('要確認事項', '待確認事項') });
+    assert.equal(revised.description, ja);
+    assert.deepEqual(revised.templateHeadings, []);
+    assert.equal(previousDraft.description, zh);
+  }
+  const [observed, expected, pending] = ja.split('\n\n');
+  await assert.rejects(run({ previousDraft: initial, language: 'ja', sentBody, description: [expected, observed, pending].join('\n\n') }), /原稿的章节/);
+
+  const fixedBody = '## 现象\n上限是58万円。\n\n## 预期\n改为62万円。';
+  const fixed = await run({ language: 'zh-CN', description: fixedBody, template: '## 现象\n\n## 预期' });
+  assert.deepEqual(fixed.templateHeadings, ['## 现象', '## 预期']);
+  const fixedTranslation = '## 现象\n上限は58万円。\n\n## 预期\n62万円に変更する。';
+  assert.equal((await run({ previousDraft: fixed, language: 'ja', sentBody: fixedBody, description: fixedTranslation })).description, fixedTranslation);
+  await assert.rejects(run({ previousDraft: fixed, language: 'ja', sentBody: fixedBody, description: [observed, expected].join('\n\n') }), /原稿的章节/);
 });
 
 test('读取失败、无 Task 或工单类型列表无效时停止生成', async () => {

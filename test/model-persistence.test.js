@@ -88,12 +88,12 @@ test('已有环境变量凭据但尚无配置文件时，首次选择可创建�
 
 test('同一服务更换 Key 保留已记住的模型，切换服务或协议后清除旧模型', async t => {
   const root = await directory(t), file = path.join(root, 'config.json');
-  const setup = key => setupSection(file, 'api', { askSecret: async () => key, ask: async () => assert.fail('已知密钥不询问服务商'), log() {}, env: {},
+  const setup = (provider, key) => setupSection(file, 'api', { provider, askSecret: async () => key, ask: async () => assert.fail('已指定服务商'), log() {}, env: {},
     fetchImpl: async url => ({ ok: true, json: async () => ({ data: String(url).endsWith('/key') ? {} : [] }) }),
   });
   await writeFile(file, JSON.stringify(config));
-  assert.equal((await setup('sk-proj-new')).model.name, 'old-model');
-  assert.equal((await setup('sk-or-v1-new')).model.name, '');
+  assert.equal((await setup('openai', 'sk-proj-new')).model.name, 'old-model');
+  assert.equal((await setup('openrouter', 'sk-or-v1-new')).model.name, '');
   await writeFile(file, JSON.stringify({ ...config, model: { ...config.model, protocol: 'chat-completions' } }));
-  assert.equal((await setup('sk-proj-newer')).model.name, '');
+  assert.equal((await setup('openai', 'sk-proj-newer')).model.name, '');
 });

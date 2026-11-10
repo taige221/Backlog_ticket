@@ -28,10 +28,14 @@
 
 在工作台左下角打开「配置工作台」。
 
-1. **模型 API Key**。登录 [OpenAI API Keys](https://platform.openai.com/api-keys) 或 [OpenRouter Keys](https://openrouter.ai/settings/keys)，创建一个密钥。把密钥粘贴到「模型 API」的「API Key」栏，点击「保存模型配置」，然后在工作台顶部选模型。若「自动识别」无法判断服务商，手动选择对应的一家。
+1. **模型 API Key**。在「模型 API」选择服务商，粘贴该服务商发放的 Key 并保存。内置 OpenAI、OpenRouter、Claude、DeepSeek、Kimi 国内站、Google Gemini、阿里云百炼北京、智谱 GLM、硅基流动国内站和火山方舟按量计费。保存后可在工作台顶部选择模型，也可以输入完整模型 ID。
 2. **Backlog API Key**。登录公司的 Backlog 站点，打开「个人设置（個人設定）→ API」，点击「注册（登録）」生成密钥。回到工作台的「Backlog」，填写站点地址（例如 `https://your-space.backlog.com`，填到域名为止）和「Backlog API Key」，点击「保存 Backlog 配置」，再选择项目和工单类型。 [Backlog 官方说明](https://support-ja.backlog.com/hc/ja/articles/360035641754-API%E3%81%AE%E8%A8%AD%E5%AE%9A)
 
 密钥在工作台界面填写，保存在本机。需要结合本地源码分析时，先选择项目，再配置该项目的代码目录。CLI 可用 `/repo` 设置当前项目的目录。
+
+其他兼容网关、服务商的其他地域或专属地址可选「自定义 API」，填写模型 API 基础地址和协议（Chat Completions 或 Responses）。若网关没有模型列表接口，请同时填入模型 ID，连接会在首次生成草稿时验证。CLI 可以运行 `npm run ticket -- config api --provider custom`，或将 `custom` 换成 `deepseek` 等服务商名称。
+
+Claude 使用 Anthropic Console 发放的 API Key。工作区专用 Key 只需填 Key，未绑定工作区的 Key 还需填写 Workspace ID。CLI 可用 `npm run ticket -- config api --provider anthropic`。
 
 模型选择框可调整「思考强度」，可选档位按模型支持情况显示，并分别记住每个模型的选择。CLI 使用 `/effort` 调整，`/effort auto` 恢复默认。
 
@@ -57,7 +61,7 @@ npx playwright install chromium
 npm run web
 ```
 
-Backlog 工单类型的标题和正文模板都可选。工作台会使用已配置的部分。用 `npm run web -- --no-template` 启动可主动跳过本次运行中所有工单类型的模板。
+Backlog 工单类型的标题和正文模板都可选。工作台会沿用已配置的章节和检查项，去掉模板里的填写提示。用 `npm run web -- --no-templates` 启动可跳过本次运行中所有工单类型的模板，也可以使用单数 `--no-template`。
 
 CLI 可运行 `npm run ticket -- init` 配置、`npm run ticket -- chat` 起票，或用 `npm run ticket -- --help` 查看命令。可在对应架构的 macOS 或 Windows 上运行 `npm run package:web` 生成发行包。
 

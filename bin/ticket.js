@@ -16,9 +16,9 @@ import { submitDraft } from '../src/submit.js';
 
 const help = `ticket — 独立 AI 起票 CLI（Node.js 22+）
 
-  ticket                              进入交互起票，首次启动输入 API Key 自动配置
+  ticket                              进入交互起票，首次启动选择服务商并输入 API Key
   ticket init                         配置模型 API、Backlog API 和可选代码目录
-  ticket config api                   单独配置模型 API Key 与服务商
+  ticket config api                   配置模型 API Key，可用 --provider 服务商 直接选择
   ticket config backlog               单独配置 Backlog 地址、API Key 与默认项目
   ticket config repo                  单独配置或清除代码目录
   ticket doctor                       检查配置与只读 Backlog 连接
@@ -67,7 +67,7 @@ async function createDraft(config, values, filename, request, previous, interact
 
 async function main() {
   const { values, positionals } = parseArgs({ allowPositionals: true, options: {
-    config: { type: 'string' }, repo: { type: 'string' }, image: { type: 'string', multiple: true }, attach: { type: 'string', multiple: true },
+    config: { type: 'string' }, provider: { type: 'string' }, repo: { type: 'string' }, image: { type: 'string', multiple: true }, attach: { type: 'string', multiple: true },
     input: { type: 'string' }, project: { type: 'string' }, type: { type: 'string' }, category: { type: 'string' }, assignee: { type: 'string' },
     start: { type: 'string' }, due: { type: 'string' }, notify: { type: 'string', multiple: true }, language: { type: 'string' }, out: { type: 'string' },
     metadata: { type: 'boolean' }, 'no-template': { type: 'boolean' }, template: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
@@ -77,12 +77,13 @@ async function main() {
   if (!command && process.stdin.isTTY && !values.help) command = 'chat';
   if (!command || values.help) return console.log(help);
   if (!['init', 'config', 'doctor', 'chat', 'draft', 'show', 'preview'].includes(command)) throw new Error(`未知命令：${command}。使用 --help 查看用法`);
+  if (values.provider !== undefined && !(command === 'config' && args[0] === 'api')) throw new Error('--provider 仅用于 ticket config api');
   const filename = resolveConfigFile(values.config);
   if (command === 'config') {
     if (!args.length) return console.log('用法：ticket config api|backlog|repo [--config 文件]\napi：模型 API；backlog：Backlog API 与项目；repo：可选代码目录。');
     if (args.length !== 1 || !['api', 'backlog', 'repo'].includes(args[0])) throw new Error('用法：ticket config api|backlog|repo [--config 文件]');
     const terminal = createTerminal();
-    try { await setupSection(filename, args[0], terminal); }
+    try { await setupSection(filename, args[0], { ...terminal, provider: values.provider }); }
     finally { terminal.close(); }
     return;
   }

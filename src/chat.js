@@ -174,7 +174,7 @@ export async function runChat(config, { ask, generate, actOnDraft, log = console
         const next = await configure(scope, config.backlog);
         if (scope === 'api') {
           const sameService = config.model?.baseUrl === next.model?.baseUrl && config.model?.protocol === next.model?.protocol;
-          const selected = sameService ? current : next.model?.name || '';
+          const selected = sameService && next.model?.provider !== 'custom' ? current : next.model?.name || '';
           const choices = localModels({ ...next, model: { ...next.model, name: selected } });
           config = { ...config, model: next.model, [credentials]: next[credentials] };
           current = selected;
