@@ -42,9 +42,18 @@
           <form id="composer" class="composer">
             <div id="composer-mode" class="composer-mode">描述一个需要处理的问题</div>
             <label class="sr-only" for="request">问题描述或修改要求</label><textarea id="request" placeholder="例如：手机上查看书类配付详情时，按钮被挤到了画面外…" rows="3"></textarea>
+            <details id="reference-form" class="reference-form">
+              <summary>关联工单与资料 <span id="reference-caption"></span></summary>
+              <label for="related-issue">Backlog 工单编号或链接</label>
+              <input id="related-issue" type="text" placeholder="例如 PROJ-123" maxlength="512" spellcheck="false">
+              <label for="reference-material">补充资料（可选）</label>
+              <textarea id="reference-material" placeholder="粘贴接口文档、MR 改动说明或差异片段" rows="2" maxlength="40000"></textarea>
+              <p class="field-hint">只填工单编号即可生成前端配合草稿。关联票正文和补充资料会发送至所选模型。</p>
+            </details>
             <div id="upload-list" class="upload-list"></div>
             <p id="screenshot-review-hint" class="composer-mode" hidden></p>
             <div class="composer-footer"><label class="attach-button" id="attach-label" title="添加截图或附件"><span aria-hidden="true">＋</span> 截图 / 附件<input id="files" type="file" multiple hidden></label><span id="composer-hint">可拖入文件，或粘贴截图</span><button id="stop-generation" class="secondary-button stop-generation" type="button" hidden>停止生成</button><button id="send" class="send-button" type="submit" data-mutation>整理草稿 <span aria-hidden="true">↑</span></button><button id="review-screenshots" class="secondary-button" type="submit" title="将已有截图再次发送给所选模型" data-mutation hidden>复核截图并更新</button></div>
+            <button id="reuse-references" class="small-button" type="submit" title="将关联票正文和粘贴的补充资料发送给当前模型" data-mutation hidden>发送原始起票资料并更新</button>
           </form>
           <p class="privacy-note">内容会发送至所选模型。附件保存在本机，可在配置工作台查看占用与清理。</p>
         </section>
@@ -52,7 +61,7 @@
           <header class="document-toolbar"><div class="document-heading"><span class="eyebrow">当前草稿</span><span id="document-status" class="document-status">等待整理</span></div><button id="draft-toggle" class="draft-toggle" type="button" aria-expanded="false" aria-controls="draft-content">展开草稿</button></header>
           <div id="draft-content" class="draft-content" hidden>
           <div id="document-empty" class="document-empty"><div class="paper-symbol" aria-hidden="true"><span></span><span></span><span></span></div><h2>你的工单，从这里成形。</h2><p>对话生成的标题、正文和附件<br>会显示在这里，随时检查。</p><span class="document-empty-label">描述 → 整理 → 确认</span></div>
-          <article id="document" class="document" hidden><div id="document-meta" class="document-meta"></div><h2 id="draft-title"></h2><div id="draft-fields" class="draft-fields"></div><div id="draft-body" class="draft-body"></div><div id="unknowns" class="unknowns" hidden><h3>待确认事项</h3><ul id="unknown-list"></ul></div><div id="document-files" class="document-files"></div><a id="issue-link" class="issue-link" target="_blank" rel="noopener noreferrer" hidden></a></article>
+          <article id="document" class="document" hidden><div id="document-meta" class="document-meta"></div><h2 id="draft-title"></h2><div id="draft-fields" class="draft-fields"></div><div id="draft-body" class="draft-body"></div><div id="unknowns" class="unknowns" hidden><h3>待确认事项</h3><ul id="unknown-list"></ul></div><section id="draft-sources" class="unknowns" hidden><h3>起票资料</h3><ul id="source-list"></ul></section><div id="document-files" class="document-files"></div><a id="issue-link" class="issue-link" target="_blank" rel="noopener noreferrer" hidden></a></article>
           <form id="draft-editor" class="document-editor" hidden>
             <label for="edit-title">标题</label><input id="edit-title" type="text" required maxlength="255" data-edit-control>
             <label for="edit-body">正文</label><textarea id="edit-body" required maxlength="40000" rows="16" spellcheck="false" aria-describedby="edit-hint" data-edit-control></textarea>

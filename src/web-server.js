@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, resolveConfigFile, saveJson, modelConnection, backlogConnection, httpUrl, ticketLanguages, rememberLanguage, selectedProjectRepo } from './config.js';
 import { configuredProvider, providers, setupSection } from './setup.js';
 import { listModelOptions, rememberModel, rememberEffort, validateEffort, selectedEffort, effortLabels } from './models.js';
-import { listProjects, listIssueTypes, rememberProject, rememberProjectType, selectedProjectType, listCategories, resolveCategory, selectedProjectCategory, rememberProjectCategory, categorySummary, listProjectUsers, resolveProjectUser } from './backlog.js';
+import { getIssueReference, listProjects, listIssueTypes, rememberProject, rememberProjectType, selectedProjectType, listCategories, resolveCategory, selectedProjectCategory, rememberProjectCategory, categorySummary, listProjectUsers, resolveProjectUser } from './backlog.js';
 import { generateDraft, readDraft, imageData, validateDraft, defaultSchedule, withDefaultSchedule } from './draft.js';
 import { openPreview } from './preview.js';
 import { submitDraft } from './submit.js';
@@ -260,7 +260,7 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
       submittedSummary = saved.summary;
       if (typeof saved.url === 'string' && /^https?:\/\//.test(saved.url)) submission.url = saved.url;
     } catch (error) { if (error.code !== 'ENOENT') submission = { state: 'unknown' }; }
-    const { summary: rawSummary, description, unknowns, target, issueType, category, language, assignee, startDate, dueDate, notifiedUsers = [], createdAt, revisionOf } = withDefaultSchedule(item.draft);
+    const { summary: rawSummary, description, unknowns, target, issueType, category, language, assignee, startDate, dueDate, notifiedUsers = [], createdAt, revisionOf, references } = withDefaultSchedule(item.draft);
     const normalizedSummary = categorySummary(rawSummary, category);
     const summary = !submission || submittedSummary === normalizedSummary ? normalizedSummary : rawSummary;
     let screenshotReview;
@@ -272,7 +272,13 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
         screenshotReview = { reason: '无法检查已有附件，请确认文件仍可读取且图片名称唯一。' };
       }
     }
+    const referencedIssue = references?.issue;
+    const sources = references && {
+      issue: referencedIssue && { key: referencedIssue.key, url: referencedIssue.url, summary: referencedIssue.summary, truncated: referencedIssue.truncated },
+      materialLength: references.material?.length,
+    };
     return { id: item.id, rootId: item.rootId, summary, description, unknowns, target, issueType, category, language, assignee, startDate, dueDate, notifiedUsers, createdAt, generationId: validId(item.draft.generationId) ? item.draft.generationId : undefined, revisionOf: revisionParentId(revisionOf),
+      ...(sources && { sources }),
       attachments: item.draft.attachments.map(file => ({ name: path.basename(file) })), submission, ...(screenshotReview && { screenshotReview }) };
   };
   const recent = async () => {
@@ -642,7 +648,11 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
           if (!images.length || images.length > 5) throw userError('请添加或替换 1 至 5 张 PNG、JPEG 或 WebP 截图');
           attachments = before.attachments;
         }
-        const request = text(previous ? body.instruction : body.request, previous ? '修改要求' : '问题描述');
+        const relatedIssue = !previous && body.relatedIssue != null ? text(body.relatedIssue, '关联工单', 512) : undefined;
+        const referenceMaterial = !previous && body.referenceMaterial != null ? text(body.referenceMaterial, '补充资料') : undefined;
+        const report = previous ? body.instruction : body.request;
+        const blankReport = report == null || (typeof report === 'string' && !report.trim());
+        const request = text(relatedIssue && blankReport ? '根据关联工单及补充资料，拟一张前端配合工单。' : report, previous ? '修改要求' : '问题描述');
         const reviewScreenshots = !!previous && !attachmentEdit && body.reviewScreenshots === true;
         if (reviewScreenshots) {
           const { files, reason } = await inspectScreenshotReview(attachments);
@@ -682,6 +692,7 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
         const uploadIds = previous ? (body.edit?.files || []).map(file => file.id).filter(uploadId) : [...newUploads.keys()];
         const resume = {
           resultId: id, baseId: previous?.id, request,
+          relatedIssue, referenceMaterial,
           uploads: [...newUploads].map(([id, { file, image }]) => ({ id, name: path.basename(file), image })),
           issueFields: previous ? null : { startDate: body.startDate, dueDate: body.dueDate, assignee: body.assignee, notifiedUsers: body.notifiedUsers },
           edit: attachmentEdit ? { summary: body.edit.summary, description: body.edit.description } : undefined,
@@ -697,8 +708,14 @@ export async function createWebApp({ filename = resolveConfigFile(), fetchImpl =
           signal.throwIfAborted();
           if (previous) await saveTurn();
           let templateWarning;
-          const generated = await generateDraft(c, { request, previousDraft: before, conversation, language: body.language, repo: attachmentEdit ? '' : undefined,
-            reviewScreenshots, noTemplate,
+          let referencedIssue;
+          if (relatedIssue) {
+            active.log('正在读取关联 Backlog 工单…');
+            referencedIssue = await getIssueReference(c, relatedIssue, { ...deps, signal });
+          }
+          const references = referencedIssue || referenceMaterial ? { issue: referencedIssue, material: referenceMaterial } : undefined;
+          const generated = await generateDraft(c, { request, previousDraft: before, conversation, references, language: body.language, repo: attachmentEdit ? '' : undefined,
+            reviewScreenshots, reuseReferences: !!previous && !attachmentEdit && body.reuseReferences === true, noTemplate,
             images, attachments, issueType: before?.issueType, assignee: before ? before.assignee : body.assignee || undefined, startDate: before ? before.startDate : body.startDate, dueDate: before ? before.dueDate : body.dueDate, notifiedUsers: before ? before.notifiedUsers : body.notifiedUsers }, {
             fetchImpl: fetchSafe, env, log: active.log, warn: message => { templateWarning = message; }, onEvent: active.onEvent, signal,
           });

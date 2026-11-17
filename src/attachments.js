@@ -72,6 +72,36 @@ export function imageReference(file, rule) {
   return rule === 'markdown' ? `![image][${name}]` : `#image(${name})`;
 }
 
+function mapIssueImageTags(description, replace) {
+  const lines = description.split(/\r?\n/);
+  const markdown = codeLayout(lines, 'markdown').code;
+  const backlog = codeLayout(lines, 'backlog').code;
+  return lines.map((line, index) => {
+    if (markdown.has(index) || backlog.has(index)) return line;
+    return line.replace(/(`+)(.*?)\1|!\[[^\]]*\]\[([^\]]+)\]|#image\(([^)]+)\)/g,
+      (tag, ticks, _literal, markdownName, backlogName) => ticks ? tag : replace(tag, markdownName ?? backlogName));
+  }).join(description.includes('\r\n') ? '\r\n' : '\n');
+}
+
+export function linkSourceIssueImages(description, url, shouldLink = () => true) {
+  return mapIssueImageTags(description, (tag, name) => shouldLink(name) ? `（截图见原票 ${url}）` : tag);
+}
+
+export function draftDescriptionForBacklog(draft, images, rule) {
+  const issue = draft.references?.issue;
+  let description = draft.description;
+  if (issue) {
+    const attachedNames = new Set(images.map(file => path.basename(file)));
+    const missingNames = new Set();
+    mapIssueImageTags(issue.description, (tag, name) => {
+      if (path.win32.basename(name) === name && !attachedNames.has(name)) missingNames.add(name);
+      return tag;
+    });
+    if (missingNames.size) description = linkSourceIssueImages(description, issue.url, name => missingNames.has(name));
+  }
+  return inlineImageDescription(description, images, rule);
+}
+
 function restorePosition(old, index, lines, headings, code) {
   const oldSection = old.headings.findLastIndex(heading => heading.line < index);
   const title = old.headings[oldSection]?.title;

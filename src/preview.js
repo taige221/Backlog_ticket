@@ -3,7 +3,7 @@ import path from 'node:path';
 import { httpUrl, projectKey } from './config.js';
 import { validateDraft, withDefaultSchedule } from './draft.js';
 import { get, listCategories, resolveCategory, categorySummary, listProjectUsers, resolveProjectUser } from './backlog.js';
-import { attachmentImages, inlineImageDescription } from './attachments.js';
+import { attachmentImages, draftDescriptionForBacklog } from './attachments.js';
 
 export function previewTarget(draft, config) {
   const origin = httpUrl(config.backlog?.origin, 'Backlog 地址', { originOnly: true });
@@ -171,11 +171,13 @@ export async function openPreview(draft, config, { profileDir, ask, signal, log 
     if (!(await stat(file)).isFile()) throw new Error(`附件不是文件：${file}`);
   }
   const images = await attachmentImages(draft.attachments);
+  let textFormattingRule;
   if (images.length) {
     const project = await get(config, `projects/${target.project}`, { fetchImpl, env, signal });
     if (project?.projectKey !== target.project) throw new Error('Backlog 项目不匹配，未填写');
-    draft = { ...draft, description: inlineImageDescription(draft.description, images, project.textFormattingRule) };
+    textFormattingRule = project.textFormattingRule;
   }
+  draft = { ...draft, description: draftDescriptionForBacklog(draft, images, textFormattingRule) };
   let chromium = injectedChromium;
   if (!chromium) {
     try { ({ chromium } = await import('playwright')); }

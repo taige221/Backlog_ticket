@@ -21,6 +21,28 @@ export async function get(config, pathname, { fetchImpl = fetch, env = process.e
   catch { throw new Error('Backlog 未返回有效 JSON，请核对站点地址'); }
 }
 
+export async function getIssueReference(config, value, options) {
+  const origin = httpUrl(config.backlog?.origin, 'Backlog 地址', { originOnly: true });
+  let key = value;
+  if (/^https?:\/\//i.test(value)) {
+    const url = new URL(httpUrl(value, '关联工单链接'));
+    if (url.origin !== origin || !/^\/view\/[^/]+$/.test(url.pathname)) throw new Error('请使用已配置的 Backlog 站点的工单详情链接');
+    key = url.pathname.slice('/view/'.length);
+  }
+  key = key.toUpperCase();
+  if (!/^[A-Z][A-Z0-9_]*-[1-9][0-9]*$/.test(key)) throw new Error('请输入有效的关联工单编号，例如 PROJ-123');
+
+  const issue = await get(config, `issues/${key}`, options);
+  if (issue?.issueKey !== key || typeof issue.summary !== 'string' || !issue.summary.trim() || typeof issue.description !== 'string') {
+    throw new Error('Backlog 返回的关联工单内容无效或与编号不符');
+  }
+  const { summary, description } = issue;
+  return { key, url: `${origin}/view/${key}`, summary, description: description.slice(0, 40_000),
+    ...(description.length > 40_000 && { truncated: true }),
+    ...(typeof issue.status?.name === 'string' && { status: issue.status.name }),
+    ...(typeof issue.updated === 'string' && { updated: issue.updated }) };
+}
+
 export async function listProjects(config, options) {
   const projects = await get(config, 'projects?archived=false', options);
   if (!Array.isArray(projects) || projects.some(project => !project || typeof project.projectKey !== 'string' || typeof project.name !== 'string')) {

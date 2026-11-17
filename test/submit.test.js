@@ -75,6 +75,22 @@ test('旧稿提交去掉模块空值尾巴，回执记录实际提交标题，�
   assert.equal(current.summary, summary);
 });
 
+test('直提旧草稿时把缺少附件的原票图片改成原票链接，保留同名本地图片', async t => {
+  const f = await fixture(t, { '/api/v2/projects/DEMO': async () => json({ id: 17, projectKey: 'DEMO', textFormattingRule: 'markdown' }) });
+  const image = path.join(f.root, 'attached.png');
+  await writeFile(image, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  const url = `${config.backlog.origin}/view/DEMO-84`;
+  const description = '旧截图\n![原图][missing.png]\n![本地补图][attached.png]';
+  const current = { ...draft, description, attachments: [image], references: {
+    issue: { key: 'DEMO-84', url, summary: '关联票', description: '#image(missing.png)\n#image(attached.png)' },
+  } };
+  await submitDraft(current, config, f);
+  const post = f.seen.find(item => item.path.endsWith('/issues'));
+  assert.equal(post.body.get('description'), `旧截图\n（截图见原票 ${url}）\n![本地补图][attached.png]`);
+  assert.deepEqual(post.body.getAll('attachmentId[]'), ['74']);
+  assert.equal(current.description, description);
+});
+
 test('图片正文引用与PDF附件一同提交，沿用项目当前格式；格式未知时在上传之前停止', async t => {
   for (const rule of ['markdown', 'backlog', undefined]) {
     const f = await fixture(t, { '/api/v2/projects/DEMO': async () => json({ id: 17, projectKey: 'DEMO', textFormattingRule: rule }) });

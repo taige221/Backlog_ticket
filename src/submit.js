@@ -6,7 +6,7 @@ import { get, listCategories, resolveCategory, categorySummary, listProjectUsers
 import { validateDraft, withDefaultSchedule } from './draft.js';
 import { previewTarget } from './preview.js';
 import { selectIssueType } from './templates.js';
-import { attachmentImages, inlineImageDescription } from './attachments.js';
+import { attachmentImages, draftDescriptionForBacklog } from './attachments.js';
 
 const id = value => Number.isSafeInteger(value) && value > 0;
 function unique(items, name, label) {
@@ -37,7 +37,7 @@ export async function submitDraft(draft, config, { receiptFile, fetchImpl = fetc
   const typeId = unique(types, selectIssueType(types, draft.issueType).name, '工单类型');
   const normal = Array.isArray(priorities) && priorities.filter(item => /^(Normal|中|通常|普通)$/i.test(item?.name));
   if (!normal || normal.length !== 1 || !id(normal[0].id)) throw new Error('无法确定普通优先级，请使用浏览器预览创建');
-  const description = inlineImageDescription(draft.description, await attachmentImages(draft.attachments), project.textFormattingRule);
+  const description = draftDescriptionForBacklog(draft, await attachmentImages(draft.attachments), project.textFormattingRule);
   const summary = categorySummary(draft.summary, draft.category);
   validateDraft({ ...draft, summary });
   const body = new URLSearchParams({ projectId: String(project.id), issueTypeId: String(typeId), priorityId: String(normal[0].id), summary, description });

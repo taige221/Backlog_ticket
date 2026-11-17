@@ -77,6 +77,19 @@ function activeGeneration() {
   return task?.running ? task : null;
 }
 
+function updateReferenceCaption() {
+  const hasIssue = !!$('related-issue').value.trim();
+  const hasMaterial = !!$('reference-material').value.trim();
+  $('reference-caption').textContent = hasIssue || hasMaterial ? '· 已填写' : '';
+}
+
+function setReferenceInputs({ relatedIssue = '', referenceMaterial = '' } = {}) {
+  $('related-issue').value = relatedIssue;
+  $('reference-material').value = referenceMaterial;
+  $('reference-form').open = !!(relatedIssue || referenceMaterial);
+  updateReferenceCaption();
+}
+
 function updateControls() {
   const task = activeGeneration();
   document.querySelectorAll('[data-mutation]').forEach(button => { button.disabled = busy || stopped || !token || editing; });
@@ -91,6 +104,9 @@ function updateControls() {
   $('stop-generation').disabled = !task || task.stopping || stopped;
   $('stop-generation').textContent = task?.stopping ? '正在停止…' : '停止生成';
   $('request').disabled = busy || stopped || !token || locked() || editing || !!task;
+  $('reference-form').hidden = !!current;
+  $('related-issue').disabled = $('reference-material').disabled = $('request').disabled;
+  $('reuse-references').hidden = !current?.sources || locked() || !!task;
   $('files').disabled = busy || stopped || !token || !!current || !!task;
   $('attach-label').hidden = !!current;
   $('attach-label').setAttribute('aria-disabled', String($('files').disabled));
@@ -217,6 +233,7 @@ function renderRecents() {
         }
         message('assistant', '已打开这份草稿。你可以预览、创建，或直接输入修改要求。');
         $('request').value = '';
+        setReferenceInputs();
         renderUploads();
         renderDraft();
         renderRecents();
@@ -261,6 +278,22 @@ function renderDraft() {
   $('draft-fields').textContent = [current.assignee && `负责人：${current.assignee}`, current.startDate && `开始日期：${current.startDate}`, current.dueDate && `截止日期：${current.dueDate}`, current.notifiedUsers?.length && `通知：${current.notifiedUsers.join('、')}`].filter(Boolean).join('\n');
   $('unknowns').hidden = !current.unknowns?.length;
   $('unknown-list').replaceChildren(...(current.unknowns || []).map(item => el('li', typeof item === 'string' ? item : JSON.stringify(item))));
+  const sources = current.sources, sourceList = $('source-list');
+  $('draft-sources').hidden = !sources;
+  sourceList.replaceChildren();
+  if (sources?.issue) {
+    const { key, url, summary, truncated } = sources.issue;
+    const label = `${key} · ${summary}${truncated ? '（正文节选）' : ''}`;
+    const item = el('li');
+    const href = safeIssueUrl(url);
+    if (href) {
+      const link = el('a', label);
+      link.href = href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+      item.append(link);
+    } else item.textContent = label;
+    sourceList.append(item);
+  }
+  if (sources?.materialLength) sourceList.append(el('li', `粘贴的补充资料 · ${sources.materialLength.toLocaleString('zh-CN')} 字符`));
   $('document-files').textContent = current.attachments?.length ? `附件 · ${current.attachments.length} 个\n${current.attachments.map(file => file.name).join('\n')}` : '';
   const issue = current.submission;
   const href = safeIssueUrl(issue?.url);
@@ -532,10 +565,14 @@ $('composer').addEventListener('submit', event => {
   event.preventDefault();
   if (locked() || editing) return;
   const request = $('request').value.trim();
-  if (!request) { $('request').focus(); return; }
+  if (!request && (current || !$('related-issue').value.trim())) { $('request').focus(); return; }
   if (!config.apiKeyConfigured) { notify('先配置模型 API，即可开始整理草稿。'); $('settings').showModal(); return; }
-  void generate(request, { reviewScreenshots: event.submitter === $('review-screenshots') });
+  void generate(request, {
+    reviewScreenshots: event.submitter === $('review-screenshots'),
+    reuseReferences: event.submitter === $('reuse-references'),
+  });
 });
+for (const id of ['related-issue', 'reference-material']) $(id).addEventListener('input', updateReferenceCaption);
 
 function restoreGenerationEdit(task) {
   if (!task.edit || !task.draft) return;
@@ -568,6 +605,7 @@ async function openGeneration(task) {
     issueFields = task.issueFields;
     uploads = task.uploads;
     $('request').value = task.input;
+    setReferenceInputs(task);
     $('chat-log').replaceChildren(...task.messages);
     workspaceView(task.running || !task.draft ? 'chat' : 'document');
     if (!task.running) {
@@ -587,7 +625,7 @@ async function openGeneration(task) {
 function prepareGeneration(task, transcript = []) {
   const label = task.revising ? '正在更新草稿…' : '正在整理草稿…';
   const fileNames = task.uploads.map(file => file.name);
-  const report = task.request + (fileNames.length ? `\n\n附件：${fileNames.join('、')}` : '');
+  const report = (task.request || '根据关联工单生成前端配合草稿') + (fileNames.length ? `\n\n附件：${fileNames.join('、')}` : '');
   task.pending = messageNode('assistant', label, true);
   task.progressText = task.pending.querySelector('.message-text');
   task.details = activityPanel();
@@ -619,6 +657,7 @@ function finishGeneration(task, { draft, activity, warning, error }) {
     current = task.draft;
     uploads = task.uploads;
     $('request').value = task.revising && !current ? '' : task.input;
+    setReferenceInputs(draft ? undefined : task);
     if (task.error) { restoreGenerationEdit(task); notify(task.error, true); }
     else {
       if (task.edit) workspaceView('document');
@@ -668,7 +707,7 @@ async function resumeGenerations(active) {
   }
 }
 
-async function generate(request, { language = current?.language || config.language, edit, reviewScreenshots } = {}) {
+async function generate(request, { language = current?.language || config.language, edit, reviewScreenshots, reuseReferences } = {}) {
   if (busy || stopped || locked() || activeGeneration()) return;
   if ([...generationTasks.values()].filter(task => task.running).length >= 2) {
     notify('最多同时生成 2 份草稿，请等待其中一份完成。', true);
@@ -679,9 +718,11 @@ async function generate(request, { language = current?.language || config.langua
   notify('');
   const id = crypto.randomUUID(), rootId = conversationId, revising = !!current;
   const input = $('request').value;
-  const task = { id, rootId, request, input, draft: current, uploads, issueFields, edit, editFiles, revising, running: true };
-  const body = revising ? { id: current.id, instruction: request, language, edit, reviewScreenshots, generationId: id }
-    : { request, uploadIds: uploads.map(file => file.id), ...pickedFields(), language, conversationId: rootId, generationId: id };
+  const relatedIssue = revising ? undefined : $('related-issue').value.trim() || undefined;
+  const referenceMaterial = revising ? undefined : $('reference-material').value.trim() || undefined;
+  const task = { id, rootId, request, input, relatedIssue, referenceMaterial, draft: current, uploads, issueFields, edit, editFiles, revising, running: true };
+  const body = revising ? { id: current.id, instruction: request, language, edit, reviewScreenshots, reuseReferences, generationId: id }
+    : { request, relatedIssue, referenceMaterial, uploadIds: uploads.map(file => file.id), ...pickedFields(), language, conversationId: rootId, generationId: id };
   generationTasks.set(rootId, task);
   if (edit) { editing = false; editFiles = []; workspaceView('chat'); }
   $('welcome')?.remove();
@@ -843,6 +884,7 @@ function resetConversation(copy = '开始一个新问题吧。描述实际情况
   current = null; issueFields = null;
   conversationId = crypto.randomUUID();
   $('request').value = '';
+  setReferenceInputs();
   $('chat-log').replaceChildren();
   message('assistant', copy);
   renderUploads(); workspaceView('chat');

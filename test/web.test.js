@@ -7,6 +7,12 @@ import { createWebApp, trustedRequest } from '../src/web-server.js';
 import { saveJson, exampleConfig } from '../src/config.js';
 
 const json = data => ({ ok: true, status: 200, json: async () => data });
+const backendTicket = {
+  issueKey: 'DEMO-84', summary: '按申请子类型筛选候选手续',
+  description: '候选请求缺少所选子类型。后端 MR 已提交，先按类型筛选再按员工去重。前端需要配合上线。\n![image][source.png]\n#image(other.png)\n`#image(example.png)`',
+  status: { name: '处理中' }, updated: '2026-11-17T05:36:11Z',
+  createdUser: { name: 'PRIVATE_USER' },
+};
 async function fixture(t, { issueTypes, ...overrides } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), 'ticket-web-test-')), filename = path.join(root, 'config.json');
   const c = { ...exampleConfig, model: { ...exampleConfig.model, name: 'test-model' }, backlog: { origin: 'https://fixture.backlog.com', project: 'DEMO' } };
@@ -25,6 +31,8 @@ async function fixture(t, { issueTypes, ...overrides } = {}) {
       const foundIssue = { id: 51, projectId: 3, issueKey: 'DEMO-51', summary: '手机布局问题', description: '官网已创建的内容', updated: '2026-11-07T00:00:00Z' };
       if (route.endsWith('/issues') && options.method === 'GET') return json([foundIssue]);
       if (route.endsWith('/issues/DEMO-51')) return json(foundIssue);
+      if (route.endsWith('/issues/DEMO-84')) return json(backendTicket);
+      if (route.includes('/issues/')) return { ok: false, status: 404 };
       if (route.endsWith('/issues')) return json({ id: 51, issueKey: 'DEMO-51' });
       if (route.endsWith('/responses')) {
         const body = JSON.parse(options.body), request = JSON.parse(body.input[0].content[0].text);
@@ -35,6 +43,51 @@ async function fixture(t, { issueTypes, ...overrides } = {}) {
   t.after(async () => { await app.close(); await rm(root, { recursive: true, force: true }); });
   return { ...app, root, filename, seen, get: route => app.dispatch('GET', `/api/${route}`), post: (route, body = {}) => app.dispatch('POST', `/api/${route}`, body) };
 }
+
+test('关联票截图改用原票链接，修改草稿只在明确选择时重发资料快照', async t => {
+  const app = await fixture(t);
+  const url = 'https://fixture.backlog.com/view/DEMO-84';
+  const material = 'GET /api/forms/target-procedures/{procedureId}\ntypeKbn 是独立 query 参数。缺失或类型不匹配时返回 400。';
+  const { draft } = await app.post('draft', { relatedIssue: url, referenceMaterial: material, uploadIds: [] });
+  assert.match(draft.summary, /前端配合/);
+  assert.deepEqual(draft.sources, {
+    issue: { key: 'DEMO-84', url, summary: backendTicket.summary, truncated: undefined }, materialLength: material.length,
+  });
+  const modelInput = () => {
+    const call = app.seen.filter(item => item.route.endsWith('/responses')).at(-1);
+    return JSON.parse(JSON.parse(call.body).input[0].content[0].text);
+  };
+  const initial = modelInput();
+  const [issueText] = backendTicket.description.split('\n');
+  const sourceLink = `（截图见原票 ${url}）`;
+  assert.deepEqual(initial.references, {
+    issue: { key: 'DEMO-84', url, summary: backendTicket.summary, description: `${issueText}\n${sourceLink}\n${sourceLink}\n\`#image(example.png)\``, status: backendTicket.status.name, updated: backendTicket.updated },
+    material,
+  });
+  assert(!JSON.stringify(draft.sources).includes(material));
+  assert(!JSON.stringify(initial).includes('PRIVATE_USER'));
+
+  const { draft: reopened } = await app.get(`drafts/${draft.id}`);
+  const { draft: revised } = await app.post('revise', { id: reopened.id, instruction: '只改标题' });
+  assert.deepEqual(revised.sources, draft.sources);
+  assert.equal(modelInput().references, undefined);
+
+  const { draft: checked } = await app.post('revise', { id: revised.id, instruction: '补充切换类型时的验收', reuseReferences: true });
+  assert.deepEqual(checked.sources, draft.sources);
+  assert.deepEqual(modelInput().references, initial.references);
+  assert.equal(app.seen.filter(item => item.route.endsWith('/issues/DEMO-84')).length, 1);
+  assert(!app.seen.some(item => item.route.endsWith('/issues') && item.method === 'POST'));
+});
+
+test('关联票无法读取时停止生成，且工单链接只允许配置站点', async t => {
+  const app = await fixture(t);
+  await assert.rejects(app.post('draft', { relatedIssue: 'https://other.test/view/DEMO-84', uploadIds: [] }), /已配置的 Backlog 站点/);
+  assert.equal(app.seen.length, 0);
+  await assert.rejects(app.post('draft', { relatedIssue: 'demo-999', uploadIds: [] }), /HTTP 404/);
+  assert(app.seen.some(item => item.route.endsWith('/issues/DEMO-999')));
+  assert(!app.seen.some(item => item.route.endsWith('/responses')));
+  assert.deepEqual((await app.get('state')).drafts, []);
+});
 
 test('local HTTP authorization rejects foreign origins, DNS rebinding, bad or Unicode tokens', () => {
   const host = '127.0.0.1:1234', token = 'a'.repeat(64);

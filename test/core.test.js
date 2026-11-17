@@ -376,6 +376,22 @@ test('官网预览为旧草稿按当前项目格式补图，先上传再填写�
   }
 });
 
+test('没有本地附件的旧草稿在官网预览中以原票链接指向截图', async t => {
+  const profileDir = await temp(t), page = fakePage();
+  const url = `${config.backlog.origin}/view/DEMO-84`;
+  const description = '复现步骤\n![image][missing.png]';
+  const draft = { ...fixture, description, references: { issue: { key: 'DEMO-84', url, summary: '关联票', description } } };
+  Object.assign(page, { setDefaultTimeout() {}, async goto() {}, url: () => previewTarget(draft, config).url });
+  await openPreview(draft, config, {
+    profileDir, ask: async () => {}, log() {},
+    fetchImpl: async () => assert.fail('无附件预览无需查询项目格式'),
+    chromium: { async launchPersistentContext() { return { once() {}, pages: () => [page], async close() {} }; } },
+  });
+  assert.equal(page.values.get('textbox:/^(description text area|Description)$/i'), `复现步骤\n（截图见原票 ${url}）`);
+  assert(!page.actions.some(([action]) => action === 'upload'));
+  assert.equal(draft.description, description);
+});
+
 test('浏览器转到当前项目工单后返回链接，其他站点或项目不算已处理', async t => {
   for (const destination of ['https://example.backlog.com/view/DEMO-7', 'https://else.test/view/DEMO-7', 'https://example.backlog.com/view/OTHER-7']) {
     const profileDir = await temp(t), page = fakePage();
